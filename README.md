@@ -12,9 +12,20 @@ Implemented surface:
 
 ## Use
 
+From GitHub:
+
 ```sh
+git clone https://github.com/waibiwaibig/all-api.git
+cd all-api
 npm install
 npm link
+all-api setup
+```
+
+After npm publish:
+
+```sh
+npm install -g all-api
 all-api setup
 ```
 

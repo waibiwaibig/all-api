@@ -4,6 +4,14 @@
   "description": "Tiny OpenAI-compatible gateway for local coding agents.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/waibiwaibig/all-api.git"
+  },
+  "bugs": {
+    "url": "https://github.com/waibiwaibig/all-api/issues"
+  },
+  "homepage": "https://github.com/waibiwaibig/all-api#readme",
   "bin": {
     "all-api": "./src/cli.mjs"
   },
