@@ -13,7 +13,7 @@
   },
   "homepage": "https://github.com/waibiwaibig/all-api#readme",
   "bin": {
-    "all-api": "./src/cli.mjs"
+    "all-api": "src/cli.mjs"
   },
   "scripts": {
     "start": "node ./src/cli.mjs up",
