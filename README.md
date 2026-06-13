@@ -30,7 +30,7 @@ all-api setup
 ```
 
 `setup` asks for the workspace directory, creates an API key, starts the server,
-and prints:
+in the background, prints the connection details, and exits:
 
 ```text
 Base URL:
@@ -62,6 +62,12 @@ Create another key:
 all-api key create --models claude-code
 ```
 
+Stop the background server:
+
+```sh
+all-api stop
+```
+
 ## Notes
 
 - No runtime dependencies.
@@ -71,3 +77,5 @@ all-api key create --models claude-code
 - Codex runs with `--sandbox read-only`.
 - Claude runs with `--permission-mode plan`.
 - Binds to `127.0.0.1` by default.
+- `/v1` is the OpenAI API version prefix. Use `http://127.0.0.1:4011/v1`
+  for OpenAI-compatible clients; root paths like `/chat/completions` also work.

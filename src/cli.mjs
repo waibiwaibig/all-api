@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import readline from "node:readline/promises";
@@ -21,6 +21,7 @@ Usage:
   all-api init [--config FILE] [--workspace DIR]
   all-api setup [--config FILE] [--workspace DIR] [--host HOST] [--port PORT] [--yes]
   all-api up [--config FILE] [--host HOST] [--port PORT]
+  all-api stop [--config FILE]
   all-api detect
   all-api key create [--config FILE] [--models MODEL,MODEL]
 
@@ -28,6 +29,7 @@ Examples:
   all-api init --workspace /path/to/repo
   all-api setup
   all-api up
+  all-api stop
   all-api key create --models codex-local,claude-code
 `);
 }
@@ -255,7 +257,7 @@ async function cmdSetup(args) {
     if (!/^n/i.test(keep)) {
       config.host = argValue(args, "--host", config.host ?? "127.0.0.1");
       config.port = Number(argValue(args, "--port", config.port ?? DEFAULT_PORT));
-      startServer(config);
+      if (!(await ensureDaemon(configPath, config))) return;
       printEndpoint(config, null);
       return;
     }
@@ -284,8 +286,95 @@ async function cmdSetup(args) {
     console.log(`Created ${configPath}`);
   }
 
-  startServer(config);
+  if (!(await ensureDaemon(configPath, config))) return;
   printEndpoint(config, generatedKey);
+}
+
+async function ensureDaemon(configPath, config) {
+  if (await isServerHealthy(config)) return true;
+
+  const pidPath = pidFileForConfig(configPath);
+  const oldPid = readPid(pidPath);
+  if (oldPid && isProcessRunning(oldPid)) {
+    console.error(`A process is already recorded for this config: ${oldPid}`);
+    console.error(`If it is stale, remove ${pidPath}`);
+    process.exitCode = 1;
+    return false;
+  }
+
+  ensureDir(dirname(pidPath));
+  const child = spawn(process.execPath, [
+    realpathSync(fileURLToPath(import.meta.url)),
+    "up",
+    "--config",
+    configPath,
+    "--host",
+    config.host,
+    "--port",
+    String(config.port),
+  ], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  writeFileSync(pidPath, `${child.pid}\n`, { mode: 0o600 });
+
+  const ready = await waitForHealth(config, 5000);
+  if (!ready) {
+    console.error("Server did not become ready within 5 seconds.");
+    console.error(`PID file: ${pidPath}`);
+    process.exitCode = 1;
+    return false;
+  }
+  return true;
+}
+
+async function waitForHealth(config, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await isServerHealthy(config)) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+function sleep(ms) {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+function isServerHealthy(config) {
+  return new Promise((resolveHealth) => {
+    const host = config.host === "0.0.0.0" ? "127.0.0.1" : config.host;
+    const req = http.request(`http://${host}:${config.port}/health`, { method: "GET", timeout: 500 }, (res) => {
+      res.resume();
+      resolveHealth(res.statusCode === 200);
+    });
+    req.on("error", () => resolveHealth(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolveHealth(false);
+    });
+    req.end();
+  });
+}
+
+function pidFileForConfig(configPath) {
+  return join(dirname(configPath), `server-${sha256(resolve(configPath)).slice(0, 12)}.pid`);
+}
+
+function readPid(pidPath) {
+  if (!existsSync(pidPath)) return null;
+  const pid = Number(readFileSync(pidPath, "utf8").trim());
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function ask(question, defaultValue) {
@@ -341,6 +430,28 @@ async function cmdUp(args) {
   printEndpoint(config, generatedKey);
 }
 
+async function cmdStop(args) {
+  const configPath = resolve(argValue(args, "--config", DEFAULT_CONFIG));
+  const pidPath = pidFileForConfig(configPath);
+  const pid = readPid(pidPath);
+  if (!pid) {
+    console.log("No all-api server PID found.");
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // Already stopped.
+    }
+  }
+  rmSync(pidPath, { force: true });
+  console.log(`Stopped all-api server ${pid}.`);
+}
+
 function printEndpoint(config, key) {
   const hostForPrint = config.host === "0.0.0.0" ? "localhost" : config.host;
   console.log("");
@@ -390,7 +501,7 @@ async function route(req, res, config) {
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/v1/models") {
+  if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
     sendJson(res, 200, {
       object: "list",
       data: allowedModels(config, auth.key).map((model) => ({
@@ -403,7 +514,7 @@ async function route(req, res, config) {
     return;
   }
 
-  if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+  if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
     const body = await readJsonBody(req);
     const model = config.models.find((m) => m.enabled && m.id === body.model);
     if (!model) {
@@ -653,6 +764,8 @@ async function main(args = process.argv.slice(2)) {
     await cmdSetup(args.slice(1));
   } else if (command === "up") {
     await cmdUp(args.slice(1));
+  } else if (command === "stop") {
+    await cmdStop(args.slice(1));
   } else if (command === "detect") {
     await cmdDetect();
   } else if (command === "key" && args[1] === "create") {
