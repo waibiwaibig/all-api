@@ -1,5 +1,5 @@
 {
-  "name": "all-api",
+  "name": "@waibiwaibig/all-api",
   "version": "0.1.0",
   "description": "Tiny OpenAI-compatible gateway for local coding agents.",
   "type": "module",
