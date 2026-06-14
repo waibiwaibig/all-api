@@ -13,6 +13,16 @@ const DEFAULT_CONFIG = join(DEFAULT_DIR, "config.json");
 const DEFAULT_PORT = 4011;
 const MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const LOCAL_AGENT_TYPES = new Set(["codex", "claude"]);
+const localAgentRuns = new Map();
+
+class HttpError extends Error {
+  constructor(status, message, type = "server_error") {
+    super(message);
+    this.status = status;
+    this.type = type;
+  }
+}
 
 function usage() {
   console.log(`all-api
@@ -83,6 +93,11 @@ function shellQuote(value) {
 function run(command, args, options = {}) {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return new Promise((resolveRun) => {
+    if (options.signal?.aborted) {
+      resolveRun({ ok: false, code: null, stdout: "", stderr: "Aborted", timedOut: false, aborted: true });
+      return;
+    }
+
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...(options.env ?? {}) },
@@ -93,11 +108,38 @@ function run(command, args, options = {}) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let aborted = false;
+    let stopping = false;
+    let settled = false;
+    let killTimer = null;
+    let timer = null;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      cleanupOwnedProcessGroup(child, timedOut || aborted ? "SIGKILL" : "SIGTERM");
+      resolveRun(result);
+    };
+
+    const stopChild = (reason) => {
+      if (stopping) return;
+      stopping = true;
+      if (reason === "timeout") timedOut = true;
+      if (reason === "abort") aborted = true;
       terminateChild(child, "SIGTERM");
-      setTimeout(() => terminateChild(child, "SIGKILL"), 2000).unref();
+      killTimer = setTimeout(() => terminateChild(child, "SIGKILL"), 2000);
+      killTimer.unref();
+    };
+
+    const onAbort = () => stopChild("abort");
+    timer = setTimeout(() => {
+      stopChild("timeout");
     }, timeoutMs);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -108,12 +150,18 @@ function run(command, args, options = {}) {
       stderr += chunk;
     });
     child.on("error", (error) => {
-      clearTimeout(timer);
-      resolveRun({ ok: false, code: null, stdout, stderr: String(error), timedOut });
+      finish({ ok: false, code: null, stdout, stderr: String(error), timedOut, aborted });
     });
     child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolveRun({ ok: code === 0, code, stdout, stderr, timedOut });
+      const interrupted = timedOut || aborted;
+      finish({
+        ok: code === 0 && !interrupted,
+        code,
+        stdout,
+        stderr: aborted && !stderr ? "Aborted" : stderr,
+        timedOut,
+        aborted,
+      });
     });
 
     if (options.input) child.stdin.end(options.input);
@@ -123,11 +171,21 @@ function run(command, args, options = {}) {
 
 function terminateChild(child, signal) {
   if (!child.pid || child.exitCode !== null) return;
+  signalOwnedProcessGroup(child.pid, signal);
+}
+
+function cleanupOwnedProcessGroup(child, signal) {
+  if (!child.pid) return;
+  signalOwnedProcessGroup(child.pid, signal, { fallbackToPid: false });
+}
+
+function signalOwnedProcessGroup(pid, signal, options = {}) {
   try {
-    process.kill(-child.pid, signal);
+    process.kill(-pid, signal);
   } catch {
+    if (options.fallbackToPid === false) return;
     try {
-      child.kill(signal);
+      process.kill(pid, signal);
     } catch {
       // Process already exited.
     }
@@ -174,6 +232,7 @@ async function buildInitialConfig(args) {
       command: "codex",
       workspace,
       timeoutMs: DEFAULT_TIMEOUT_MS,
+      maxConcurrent: 1,
       enabled: true,
     });
   }
@@ -185,6 +244,7 @@ async function buildInitialConfig(args) {
       command: "claude",
       workspace,
       timeoutMs: DEFAULT_TIMEOUT_MS,
+      maxConcurrent: 1,
       enabled: true,
     });
   }
@@ -475,10 +535,11 @@ function startServer(config) {
     try {
       await route(req, res, config);
     } catch (error) {
-      sendJson(res, 500, {
+      if (res.destroyed || res.writableEnded) return;
+      sendJson(res, error.status ?? 500, {
         error: {
           message: error?.message ?? "Internal server error",
-          type: "server_error",
+          type: error?.type ?? "server_error",
         },
       });
     }
@@ -526,12 +587,35 @@ async function route(req, res, config) {
       return;
     }
 
-    const result = await complete(model, body);
+    const requestLifetime = createRequestLifetime(req, res);
+    let result;
+    try {
+      result = await complete(model, body, { signal: requestLifetime.signal });
+    } finally {
+      requestLifetime.cleanup();
+    }
+    if (requestLifetime.signal.aborted || res.destroyed || res.writableEnded) return;
     sendJson(res, 200, result);
     return;
   }
 
   sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
+}
+
+function createRequestLifetime(req, res) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on("aborted", abort);
+  res.on("close", abort);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.off("aborted", abort);
+      res.off("close", abort);
+    },
+  };
 }
 
 function authenticate(req, config) {
@@ -583,14 +667,37 @@ function readJsonBody(req) {
   });
 }
 
-async function complete(model, body) {
-  if (model.type === "codex") return completeWithCodex(model, body);
-  if (model.type === "claude") return completeWithClaude(model, body);
-  if (model.type === "openai-compatible") return completeWithOpenAICompatible(model, body);
+async function complete(model, body, options = {}) {
+  const release = LOCAL_AGENT_TYPES.has(model.type) ? acquireLocalAgentSlot(model) : null;
+  try {
+    if (model.type === "codex") return await completeWithCodex(model, body, options);
+    if (model.type === "claude") return await completeWithClaude(model, body, options);
+    if (model.type === "openai-compatible") return await completeWithOpenAICompatible(model, body, options);
+  } finally {
+    release?.();
+  }
   throw new Error(`Unsupported model type: ${model.type}`);
 }
 
-async function completeWithCodex(model, body) {
+function acquireLocalAgentSlot(model) {
+  const maxConcurrent = Math.max(1, Number(model.maxConcurrent ?? 1) || 1);
+  const current = localAgentRuns.get(model.id) ?? 0;
+  if (current >= maxConcurrent) {
+    throw new HttpError(
+      429,
+      `${model.id} is busy. all-api keeps local ${model.type} runs to ${maxConcurrent} at a time so repeated hotkeys do not pile up agent processes.`,
+      "rate_limit_error",
+    );
+  }
+  localAgentRuns.set(model.id, current + 1);
+  return () => {
+    const next = (localAgentRuns.get(model.id) ?? 1) - 1;
+    if (next > 0) localAgentRuns.set(model.id, next);
+    else localAgentRuns.delete(model.id);
+  };
+}
+
+async function completeWithCodex(model, body, options = {}) {
   const prompt = messagesToPrompt(body.messages);
   const result = await run(model.command ?? "codex", [
     "exec",
@@ -602,13 +709,13 @@ async function completeWithCodex(model, body) {
     "--cd",
     model.workspace ?? process.cwd(),
     prompt,
-  ], { timeoutMs: model.timeoutMs });
+  ], { timeoutMs: model.timeoutMs, signal: options.signal });
 
   if (!result.ok) throw new Error(result.stderr || `codex exited with code ${result.code}`);
   return chatCompletion(body.model, extractCodexText(result.stdout));
 }
 
-async function completeWithClaude(model, body) {
+async function completeWithClaude(model, body, options = {}) {
   const prompt = messagesToPrompt(body.messages);
   const result = await run(model.command ?? "claude", [
     "-p",
@@ -621,13 +728,14 @@ async function completeWithClaude(model, body) {
   ], {
     cwd: model.workspace ?? process.cwd(),
     timeoutMs: model.timeoutMs,
+    signal: options.signal,
   });
 
   if (!result.ok) throw new Error(result.stderr || `claude exited with code ${result.code}`);
   return chatCompletion(body.model, extractClaudeText(result.stdout));
 }
 
-async function completeWithOpenAICompatible(model, body) {
+async function completeWithOpenAICompatible(model, body, options = {}) {
   const url = new URL(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`);
   const upstreamBody = {
     ...body,
@@ -645,6 +753,7 @@ async function completeWithOpenAICompatible(model, body) {
     method: "POST",
     headers,
     body: JSON.stringify(upstreamBody),
+    signal: options.signal,
   });
   const text = await response.text();
   if (!response.ok) throw new Error(text || `upstream returned ${response.status}`);
@@ -747,9 +856,11 @@ function sendJson(res, status, value) {
 }
 
 export {
+  acquireLocalAgentSlot,
   chatCompletion,
   extractClaudeText,
   extractCodexText,
+  run,
   messagesToPrompt,
 };
 

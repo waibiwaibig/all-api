@@ -73,6 +73,8 @@ all-api stop
 - No runtime dependencies.
 - No Docker or database.
 - Each request starts a fresh agent process.
+- Local Codex/Claude adapters run one request per model at a time by default,
+  and all-api only terminates the process group it created for that request.
 - Stores API key hashes, not raw keys.
 - Codex runs with `--sandbox read-only`.
 - Claude runs with `--permission-mode plan`.
