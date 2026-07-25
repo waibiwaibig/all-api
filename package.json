@@ -1,7 +1,7 @@
 {
   "name": "@waibiwaibig/all-api",
-  "version": "0.1.1",
-  "description": "Tiny OpenAI-compatible gateway for local coding agents.",
+  "version": "0.2.0",
+  "description": "Local bridge exposing coding agents through OpenAI, Anthropic, and native protocols.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -15,12 +15,24 @@
   "bin": {
     "all-api": "src/cli.mjs"
   },
+  "files": [
+    "src",
+    "DECISION_MAP.md"
+  ],
   "scripts": {
     "start": "node ./src/cli.mjs up",
     "detect": "node ./src/cli.mjs detect",
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/agents.mjs && node --check src/admin.mjs && node --check src/platform.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
+    "ws": "^8.21.1"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11"
   }
 }

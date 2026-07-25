@@ -1,0 +1,1389 @@
+import crypto from "node:crypto";
+import { createServer } from "node:http";
+import { lookup } from "node:dns/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { WebSocketServer } from "ws";
+import {
+  authorize,
+  ConcurrencyGate,
+  HttpError,
+  requireGrant,
+  strictObject,
+  validateConfig,
+} from "./core.mjs";
+
+const MAX_JSON_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+export async function createAllApiServer({ config, registry, dataDirectory }) {
+  validateConfig(config);
+  const responses = new ResponseStore(path.join(dataDirectory, "responses.json"));
+  await responses.load();
+  const files = new FileStore(path.join(dataDirectory, "files"));
+  await files.load();
+  const gate = new ConcurrencyGate(config.server.maxConcurrent);
+  const controllers = new Set();
+  const nativeSessions = new Set();
+  const server = createServer(async (request, response) => {
+    try {
+      await route({ request, response, config, registry, responses, files, gate, controllers });
+    } catch (error) {
+      if (process.env.ALL_API_DEBUG === "1") console.error(error);
+      sendError(response, error, Boolean(request.headers["anthropic-version"]));
+    }
+  });
+  const sockets = new Set();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  const webSockets = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (request, socket, head) => {
+    handleUpgrade({
+      request, socket, head, config, registry, webSockets, gate, nativeSessions,
+    }).catch(() => {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+    });
+  });
+
+  return {
+    server,
+    registry,
+    responses,
+    files,
+    async listen() {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(config.server.port, config.server.host, resolve);
+      });
+      return server.address();
+    },
+    async close() {
+      await Promise.allSettled([...nativeSessions].map((close) => close()));
+      for (const client of webSockets.clients) client.terminate();
+      for (const controller of controllers) controller.abort(new Error("All API is shutting down"));
+      await new Promise((resolve) => webSockets.close(resolve));
+      server.close();
+      for (const socket of sockets) socket.destroy();
+      await registry.close();
+      await Promise.all([responses.flush(), files.flush()]);
+    },
+  };
+}
+
+async function route(context) {
+  const { request, response, config } = context;
+  const url = new URL(request.url, "http://all-api.local");
+  if (request.method === "GET" && url.pathname === "/health") {
+    return sendJson(response, 200, { status: "ok" });
+  }
+  const token = bearerOrApiKey(request);
+  const grant = await authorize(config, token);
+
+  if (request.method === "GET" && url.pathname === "/v1/models") {
+    return sendJson(response, 200, request.headers["anthropic-version"]
+      ? anthropicModels(context, grant)
+      : openAiModels(context, grant));
+  }
+  if (request.method === "GET" && url.pathname.startsWith("/v1/models/")) {
+    const id = decodeURIComponent(url.pathname.slice("/v1/models/".length));
+    requireGrant(grant, "model", id);
+    if (!config.models[id]) throw new HttpError(404, `Model "${id}" not found`, "not_found");
+    return sendJson(response, 200, request.headers["anthropic-version"]
+      ? anthropicModel(context, id)
+      : openAiModel(context, id));
+  }
+  if (request.method === "GET" && url.pathname === "/allapi/v1/catalog") {
+    return sendJson(response, 200, catalog(context, grant));
+  }
+  if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
+    return chatCompletions(context, grant);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/responses") {
+    return createResponse(context, grant);
+  }
+  if (url.pathname.startsWith("/v1/responses/")) {
+    return responseLifecycle(context, grant, url);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/messages") {
+    requireAnthropicVersion(request);
+    return messages(context, grant);
+  }
+  if (url.pathname === "/v1/files" || url.pathname.startsWith("/v1/files/")) {
+    return filesRoute(context, grant, url);
+  }
+  throw new HttpError(404, `Unknown endpoint: ${request.method} ${url.pathname}`, "not_found");
+}
+
+async function chatCompletions(context, grant) {
+  const { request, response } = context;
+  const body = strictObject(await readJson(request), CHAT_FIELDS, ["model", "messages"]);
+  ensureArray(body.messages, "messages");
+  const converted = chatInput(body.messages);
+  const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
+    ...converted,
+    tools: validateOpenAiTools(body.tools),
+  });
+  if (body.stream) {
+    startSse(response);
+    let roleSent = false;
+    let toolSeen = false;
+    for await (const event of run.events) {
+      if (event.type === "text.delta") {
+        sendSse(response, {
+          id: run.id,
+          object: "chat.completion.chunk",
+          created: run.created,
+          model: body.model,
+          choices: [{
+            index: 0,
+            delta: roleSent ? { content: event.delta } : { role: "assistant", content: event.delta },
+            finish_reason: null,
+          }],
+        });
+        roleSent = true;
+      } else if (event.type === "client.tool") {
+        toolSeen = true;
+        sendSse(response, {
+          id: run.id,
+          object: "chat.completion.chunk",
+          created: run.created,
+          model: body.model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: event.id,
+                type: "function",
+                function: {
+                  name: event.name,
+                  arguments: typeof event.arguments === "string"
+                    ? event.arguments
+                    : JSON.stringify(event.arguments),
+                },
+              }],
+            },
+            finish_reason: null,
+          }],
+        });
+      } else if (event.type === "completed") {
+        sendSse(response, {
+          id: run.id,
+          object: "chat.completion.chunk",
+          created: run.created,
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: toolSeen ? "tool_calls" : "stop" }],
+          ...(body.stream_options?.include_usage && event.usage
+            ? { usage: openAiUsage(event.usage) }
+            : {}),
+        });
+      }
+    }
+    writeIfOpen(response, "data: [DONE]\n\n");
+    return response.end();
+  }
+
+  const result = await collect(run.events);
+  return sendJson(response, 200, {
+    id: run.id,
+    object: "chat.completion",
+    created: run.created,
+    model: body.model,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: result.text || null,
+        ...(result.toolCalls.length && { tool_calls: result.toolCalls.map(openAiToolCall) }),
+      },
+      finish_reason: result.toolCalls.length ? "tool_calls" : "stop",
+    }],
+    ...(result.usage && { usage: openAiUsage(result.usage) }),
+  });
+}
+
+async function createResponse(context, grant) {
+  const { request, response, responses } = context;
+  const body = strictObject(await readJson(request), RESPONSE_FIELDS, ["model", "input"]);
+  const previous = body.previous_response_id
+    ? responses.require(body.previous_response_id, grant.keyId)
+    : undefined;
+  if (previous && (previous.model !== body.model || previous.workspace !== workspaceId(request, grant))) {
+    throw new HttpError(400, "previous_response_id belongs to a different model or workspace");
+  }
+  const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
+    input: responseInput(body.input),
+    instructions: body.instructions,
+    tools: validateResponseTools(body.tools),
+    sessionId: previous?.agentSessionId,
+  });
+  const record = responses.create({
+    id: run.id.replace("chatcmpl_", "resp_"),
+    keyId: grant.keyId,
+    model: body.model,
+    workspace: run.workspace,
+    controller: run.controller,
+  });
+  if (body.stream) {
+    startSse(response);
+    let sequence = 0;
+    sendSse(response, {
+      type: "response.created",
+      response: responseEnvelope(record, "in_progress"),
+      sequence_number: sequence++,
+    }, "response.created");
+    sendSse(response, {
+      type: "response.in_progress",
+      response: responseEnvelope(record, "in_progress"),
+      sequence_number: sequence++,
+    }, "response.in_progress");
+    let text = "";
+    let textStarted = false;
+    const toolCalls = [];
+    for await (const event of run.events) {
+      if (event.type === "text.delta") {
+        if (!textStarted) {
+          textStarted = true;
+          sendSse(response, {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: responseMessage(record, "", "in_progress"),
+            sequence_number: sequence++,
+          }, "response.output_item.added");
+          sendSse(response, {
+            type: "response.content_part.added",
+            item_id: `${record.id}_message`,
+            output_index: 0,
+            content_index: 0,
+            part: { type: "output_text", text: "", annotations: [] },
+            sequence_number: sequence++,
+          }, "response.content_part.added");
+        }
+        text += event.delta;
+        sendSse(response, {
+          type: "response.output_text.delta",
+          item_id: `${record.id}_message`,
+          output_index: 0,
+          content_index: 0,
+          delta: event.delta,
+          sequence_number: sequence++,
+        }, "response.output_text.delta");
+      } else if (event.type === "client.tool") {
+        toolCalls.push(event);
+        const outputIndex = (textStarted ? 1 : 0) + toolCalls.length - 1;
+        sendSse(response, {
+          type: "response.output_item.added",
+          output_index: outputIndex,
+          item: { ...responseToolCall(event), status: "in_progress" },
+          sequence_number: sequence++,
+        }, "response.output_item.added");
+        sendSse(response, {
+          type: "response.output_item.done",
+          output_index: outputIndex,
+          item: responseToolCall(event),
+          sequence_number: sequence++,
+        }, "response.output_item.done");
+      } else if (event.type === "completed") {
+        if (textStarted) {
+          sendSse(response, {
+            type: "response.output_text.done",
+            item_id: `${record.id}_message`,
+            output_index: 0,
+            content_index: 0,
+            text,
+            sequence_number: sequence++,
+          }, "response.output_text.done");
+          sendSse(response, {
+            type: "response.content_part.done",
+            item_id: `${record.id}_message`,
+            output_index: 0,
+            content_index: 0,
+            part: { type: "output_text", text, annotations: [] },
+            sequence_number: sequence++,
+          }, "response.content_part.done");
+          sendSse(response, {
+            type: "response.output_item.done",
+            output_index: 0,
+            item: responseMessage(record, text, "completed"),
+            sequence_number: sequence++,
+          }, "response.output_item.done");
+        }
+        responses.complete(record.id, {
+          agentSessionId: event.sessionId,
+          usage: event.usage,
+        });
+        const completed = responseEnvelope(record, "completed", text, event.usage, toolCalls);
+        sendSse(response, {
+          type: "response.completed",
+          response: completed,
+          sequence_number: sequence++,
+        }, "response.completed");
+      }
+    }
+    return response.end();
+  }
+
+  try {
+    const result = await collect(run.events);
+    responses.complete(record.id, {
+      agentSessionId: result.sessionId,
+      usage: result.usage,
+    });
+    return sendJson(response, 200, responseEnvelope(
+      record, "completed", result.text, result.usage, result.toolCalls,
+    ));
+  } catch (error) {
+    responses.fail(record.id, error);
+    throw error;
+  }
+}
+
+async function responseLifecycle(context, grant, url) {
+  const { request, response, responses } = context;
+  const [, , , id, action] = url.pathname.split("/");
+  const record = responses.require(id, grant.keyId);
+  if (request.method === "POST" && action === "cancel") {
+    responses.cancel(id);
+    return sendJson(response, 200, responseEnvelope(record, "cancelled"));
+  }
+  if (request.method === "DELETE" && !action) {
+    responses.delete(id);
+    return sendJson(response, 200, { id, object: "response.deleted", deleted: true });
+  }
+  if (request.method === "GET" && !action) {
+    return sendJson(response, 200, responseEnvelope(record, record.status));
+  }
+  throw new HttpError(404, "Response operation not found", "not_found");
+}
+
+async function messages(context, grant) {
+  const { request, response } = context;
+  const body = strictObject(await readJson(request), MESSAGE_FIELDS, ["model", "max_tokens", "messages"]);
+  ensureArray(body.messages, "messages");
+  const converted = anthropicInput(body.messages, body.system);
+  const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
+    ...converted,
+    tools: validateAnthropicTools(body.tools),
+  });
+  const messageId = run.id.replace("chatcmpl_", "msg_");
+  if (body.stream) {
+    startSse(response);
+    sendSse(response, {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: body.model,
+        stop_reason: null,
+        stop_sequence: null,
+      },
+    }, "message_start");
+    sendSse(response, {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }, "content_block_start");
+    let contentIndex = 0;
+    let toolSeen = false;
+    for await (const event of run.events) {
+      if (event.type === "text.delta") {
+        sendSse(response, {
+          type: "content_block_delta",
+          index: contentIndex,
+          delta: { type: "text_delta", text: event.delta },
+        }, "content_block_delta");
+      } else if (event.type === "client.tool") {
+        toolSeen = true;
+        contentIndex += 1;
+        sendSse(response, {
+          type: "content_block_start",
+          index: contentIndex,
+          content_block: { type: "tool_use", id: event.id, name: event.name, input: {} },
+        }, "content_block_start");
+        sendSse(response, {
+          type: "content_block_delta",
+          index: contentIndex,
+          delta: {
+            type: "input_json_delta",
+            partial_json: typeof event.arguments === "string"
+              ? event.arguments
+              : JSON.stringify(event.arguments),
+          },
+        }, "content_block_delta");
+        sendSse(response, { type: "content_block_stop", index: contentIndex }, "content_block_stop");
+      } else if (event.type === "completed") {
+        sendSse(response, {
+          type: "content_block_stop",
+          index: 0,
+        }, "content_block_stop");
+        sendSse(response, {
+          type: "message_delta",
+          delta: { stop_reason: toolSeen ? "tool_use" : "end_turn", stop_sequence: null },
+          usage: event.usage ? { output_tokens: event.usage.output_tokens } : {},
+        }, "message_delta");
+        sendSse(response, { type: "message_stop" }, "message_stop");
+      }
+    }
+    return response.end();
+  }
+  const result = await collect(run.events);
+  return sendJson(response, 200, {
+    id: messageId,
+    type: "message",
+    role: "assistant",
+    content: [
+      ...(result.text ? [{ type: "text", text: result.text }] : []),
+      ...result.toolCalls.map((event) => ({
+        type: "tool_use",
+        id: event.id,
+        name: event.name,
+        input: typeof event.arguments === "string"
+          ? parseToolArguments(event.arguments)
+          : event.arguments,
+      })),
+    ],
+    model: body.model,
+    stop_reason: result.toolCalls.length ? "tool_use" : "end_turn",
+    stop_sequence: null,
+    ...(result.usage && { usage: result.usage }),
+  });
+}
+
+async function prepareRun(context, grant, modelId, selectedWorkspace, options) {
+  const { config, registry, gate, files, controllers } = context;
+  requireGrant(grant, "model", modelId);
+  const profile = config.models[modelId];
+  if (!profile) throw new HttpError(404, `Model "${modelId}" does not exist`, "model_not_found");
+  const workspace = selectedWorkspace || defaultWorkspace(grant);
+  requireGrant(grant, "workspace", workspace);
+  const workspaceConfig = config.workspaces[workspace];
+  if (!workspaceConfig) throw new HttpError(404, `Workspace "${workspace}" does not exist`);
+  const adapter = registry.get(profile.agent);
+  const input = await Promise.all(options.input.map((block) => resolveInputBlock(block, files, grant.keyId)));
+  assertCapabilities(adapter.capabilities, input, options.tools);
+  const release = gate.acquire();
+  const controller = new AbortController();
+  controllers.add(controller);
+  const events = releaseWhenDone(adapter.run({
+    model: modelId,
+    profile,
+    workspace: { id: workspace, ...workspaceConfig },
+    input,
+    instructions: options.instructions,
+    tools: options.tools,
+    sessionId: options.sessionId,
+    signal: controller.signal,
+  }), () => {
+    controllers.delete(controller);
+    release();
+  });
+  return {
+    id: `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`,
+    created: Math.floor(Date.now() / 1000),
+    workspace,
+    controller,
+    events,
+  };
+}
+
+async function filesRoute(context, grant, url) {
+  const { request, response, files } = context;
+  const anthropic = Boolean(request.headers["anthropic-version"]);
+  if (anthropic && !String(request.headers["anthropic-beta"] ?? "").split(",").map((v) => v.trim())
+    .includes("files-api-2025-04-14")) {
+    throw new HttpError(400, "anthropic-beta: files-api-2025-04-14 is required");
+  }
+  if (request.method === "POST" && url.pathname === "/v1/files") {
+    const body = await readBuffer(request, MAX_FILE_BYTES);
+    const form = await new Request("http://all-api.local/v1/files", {
+      method: "POST",
+      headers: { "content-type": request.headers["content-type"] ?? "" },
+      body,
+    }).formData();
+    const upload = form.get("file");
+    if (!upload || typeof upload.arrayBuffer !== "function") {
+      throw new HttpError(400, "multipart field 'file' is required");
+    }
+    const purpose = form.get("purpose");
+    if (!anthropic && !purpose) throw new HttpError(400, "multipart field 'purpose' is required");
+    const result = await files.create({
+      owner: grant.keyId,
+      filename: upload.name,
+      purpose: anthropic ? "anthropic" : String(purpose),
+      mediaType: upload.type || "application/octet-stream",
+      bytes: Buffer.from(await upload.arrayBuffer()),
+    });
+    return sendJson(response, 200, anthropic ? anthropicFile(result) : files.public(result));
+  }
+  if (request.method === "GET" && url.pathname === "/v1/files") {
+    const records = files.records(grant.keyId);
+    const items = records.map((file) => files.public(file));
+    return sendJson(response, 200, anthropic ? {
+      data: records.map(anthropicFile),
+      first_id: items[0]?.id ?? null,
+      last_id: items.at(-1)?.id ?? null,
+      has_more: false,
+    } : { object: "list", data: items, has_more: false });
+  }
+  const parts = url.pathname.split("/");
+  const id = parts[3];
+  if (!id) throw new HttpError(404, "File not found", "not_found");
+  if (request.method === "GET" && parts[4] === "content") {
+    const file = files.require(id, grant.keyId);
+    if (anthropic) throw new HttpError(400, "Uploaded Anthropic files are not downloadable");
+    response.writeHead(200, {
+      "content-type": file.mediaType,
+      "content-length": file.bytes,
+      "content-disposition": `attachment; filename="${safeFilename(file.filename)}"`,
+    });
+    return response.end(await readFile(file.path));
+  }
+  if (request.method === "GET" && !parts[4]) {
+    const file = files.public(files.require(id, grant.keyId));
+    return sendJson(response, 200, anthropic ? anthropicFile(file) : file);
+  }
+  if (request.method === "DELETE" && !parts[4]) {
+    await files.delete(id, grant.keyId);
+    return sendJson(response, 200, anthropic
+      ? { id, type: "file_deleted" }
+      : { id, object: "file", deleted: true });
+  }
+  throw new HttpError(404, "File operation not found", "not_found");
+}
+
+async function handleUpgrade({
+  request, socket, head, config, registry, webSockets, gate, nativeSessions,
+}) {
+  const url = new URL(request.url, "http://all-api.local");
+  if (url.pathname !== "/v1/native/sessions") throw new Error("not found");
+  const grant = await authorize(config, bearerOrApiKey(request));
+  const modelId = url.searchParams.get("model");
+  const workspaceId = url.searchParams.get("workspace") || defaultWorkspace(grant);
+  requireGrant(grant, "model", modelId);
+  requireGrant(grant, "workspace", workspaceId);
+  const profile = config.models[modelId];
+  const workspace = config.workspaces[workspaceId];
+  const adapter = registry.get(profile.agent);
+  if (!adapter.capabilities.native || !adapter.openNative) {
+    throw new Error(`Model "${modelId}" has no native transport`);
+  }
+  webSockets.handleUpgrade(request, socket, head, async (webSocket) => {
+    let native;
+    let activeRelease;
+    let disconnected = false;
+    const closeNative = async () => {
+      const current = native;
+      if (!current) return;
+      native = undefined;
+      nativeSessions.delete(closeNative);
+      activeRelease?.();
+      activeRelease = undefined;
+      await current.close();
+    };
+    try {
+      native = await adapter.openNative({
+        profile,
+        workspace: { id: workspaceId, ...workspace },
+        sessionId: url.searchParams.get("session_id") || undefined,
+        send(payload) {
+          if (isNativeCompletion(payload)) {
+            activeRelease?.();
+            activeRelease = undefined;
+            if (disconnected) closeNative().catch(() => {});
+          }
+          if (webSocket.readyState === webSocket.OPEN) {
+            webSocket.send(JSON.stringify({ type: "agent.event", payload }));
+          }
+        },
+      });
+      nativeSessions.add(closeNative);
+      webSocket.on("message", async (data) => {
+        let acquired = false;
+        try {
+          const envelope = JSON.parse(data.toString());
+          if (envelope.type !== "agent.input" || envelope.payload === undefined) {
+            throw new Error("Native messages require {type:'agent.input', payload}");
+          }
+          if (isNativeTurnStart(envelope.payload) && !activeRelease) {
+            activeRelease = gate.acquire();
+            acquired = true;
+          }
+          await native.receive(envelope.payload);
+        } catch (error) {
+          if (acquired) {
+            activeRelease?.();
+            activeRelease = undefined;
+          }
+          if (webSocket.readyState === webSocket.OPEN) {
+            webSocket.send(JSON.stringify({
+              type: "transport.error",
+              error: { message: error.message },
+            }));
+          }
+        }
+      });
+      webSocket.once("close", () => {
+        disconnected = true;
+        if (!activeRelease) closeNative().catch(() => {});
+      });
+    } catch (error) {
+      webSocket.close(1011, error.message.slice(0, 120));
+    }
+  });
+}
+
+function isNativeCompletion(payload) {
+  return payload?.method === "turn/completed"
+    || payload?.method === "turn/failed"
+    || payload?.type === "result"
+    || payload?.type === "transport.exit";
+}
+
+function isNativeTurnStart(payload) {
+  return payload?.method === "turn/start"
+    || payload?.type === "user"
+    || typeof payload === "string";
+}
+
+export class ResponseStore {
+  #records = new Map();
+  #saving = Promise.resolve();
+
+  constructor(filename) {
+    this.filename = filename;
+  }
+
+  async load() {
+    if (!this.filename) return;
+    try {
+      const records = JSON.parse(await readFile(this.filename, "utf8"));
+      for (const record of records) {
+        if (record.status === "in_progress") record.status = "interrupted";
+        this.#records.set(record.id, record);
+      }
+      await this.#save();
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+
+  create(record) {
+    const value = {
+      ...record,
+      object: "response",
+      status: "in_progress",
+      createdAt: Math.floor(Date.now() / 1000),
+    };
+    this.#records.set(value.id, value);
+    this.#save().catch(() => {});
+    return value;
+  }
+
+  complete(id, metadata) {
+    const record = this.#records.get(id);
+    if (!record) return;
+    record.status = "completed";
+    record.agentSessionId = metadata.agentSessionId;
+    record.usage = metadata.usage;
+    delete record.controller;
+    this.#save().catch(() => {});
+  }
+
+  fail(id, error) {
+    const record = this.#records.get(id);
+    if (!record) return;
+    record.status = "failed";
+    record.error = {
+      code: error.code ?? "agent_error",
+      type: "server_error",
+      message: "Agent execution failed",
+    };
+    delete record.controller;
+    this.#save().catch(() => {});
+  }
+
+  cancel(id) {
+    const record = this.#records.get(id);
+    record?.controller?.abort(new Error("Cancelled by client"));
+    if (record) {
+      record.status = "cancelled";
+      delete record.controller;
+      this.#save().catch(() => {});
+    }
+  }
+
+  require(id, keyId) {
+    const record = this.#records.get(id);
+    if (!record || record.keyId !== keyId) throw new HttpError(404, `Response "${id}" not found`, "not_found");
+    return record;
+  }
+
+  delete(id) {
+    this.#records.delete(id);
+    this.#save().catch(() => {});
+  }
+
+  snapshot() {
+    return [...this.#records.values()].map(({ controller, keyId, ...record }) => ({ ...record }));
+  }
+
+  flush() {
+    return this.#saving;
+  }
+
+  async #save() {
+    if (!this.filename) return;
+    this.#saving = this.#saving.catch(() => {}).then(async () => {
+      await mkdir(path.dirname(this.filename), { recursive: true, mode: 0o700 });
+      const temporary = `${this.filename}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      const records = [...this.#records.values()].map(({ controller, ...record }) => record);
+      await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
+      await rename(temporary, this.filename);
+    });
+    return this.#saving;
+  }
+}
+
+class FileStore {
+  #files = new Map();
+  #saving = Promise.resolve();
+
+  constructor(directory) {
+    this.directory = directory;
+    this.indexPath = path.join(directory, "index.json");
+  }
+
+  async load() {
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    try {
+      for (const item of JSON.parse(await readFile(this.indexPath, "utf8"))) this.#files.set(item.id, item);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+
+  async create({ owner, filename, purpose, mediaType, bytes }) {
+    const id = `file_${crypto.randomUUID().replaceAll("-", "")}`;
+    const filePath = path.join(this.directory, id);
+    await writeFile(filePath, bytes, { mode: 0o600, flag: "wx" });
+    const record = {
+      id,
+      object: "file",
+      bytes: bytes.length,
+      created_at: Math.floor(Date.now() / 1000),
+      filename,
+      purpose,
+      mediaType,
+      owner,
+      path: filePath,
+    };
+    this.#files.set(id, record);
+    await this.#save();
+    return record;
+  }
+
+  records(owner) {
+    return [...this.#files.values()].filter((file) => file.owner === owner);
+  }
+
+  require(id, owner) {
+    const file = this.#files.get(id);
+    if (!file || file.owner !== owner) throw new HttpError(404, `File "${id}" not found`, "not_found");
+    return file;
+  }
+
+  public({ owner, path: filePath, mediaType, ...record }) {
+    return record;
+  }
+
+  async delete(id, owner) {
+    const file = this.require(id, owner);
+    await rm(file.path, { force: true });
+    this.#files.delete(id);
+    await this.#save();
+  }
+
+  flush() {
+    return this.#saving;
+  }
+
+  async #save() {
+    this.#saving = this.#saving.catch(() => {}).then(() =>
+      writeFile(this.indexPath, JSON.stringify([...this.#files.values()]), { mode: 0o600 }));
+    return this.#saving;
+  }
+}
+
+const CHAT_FIELDS = [
+  "model", "messages", "stream", "stream_options", "tools", "tool_choice",
+  "parallel_tool_calls", "metadata", "user",
+];
+const RESPONSE_FIELDS = [
+  "model", "input", "previous_response_id", "stream", "tools", "tool_choice",
+  "parallel_tool_calls", "metadata", "store", "instructions",
+];
+const MESSAGE_FIELDS = [
+  "model", "max_tokens", "messages", "system", "stream", "tools", "tool_choice",
+  "metadata", "stop_sequences",
+];
+
+function openAiModels({ config, registry }, grant) {
+  return {
+    object: "list",
+    data: grant.models.filter((id) => config.models[id]).map((id) => openAiModel({ config }, id)),
+  };
+}
+
+function openAiModel({ config }, id) {
+  return {
+    id,
+    object: "model",
+    created: 0,
+    owned_by: `all-api:${config.models[id].agent}`,
+  };
+}
+
+function anthropicModels(context, grant) {
+  const data = grant.models.filter((id) => context.config.models[id]).map((id) => anthropicModel(context, id));
+  return {
+    data,
+    first_id: data[0]?.id ?? null,
+    last_id: data.at(-1)?.id ?? null,
+    has_more: false,
+  };
+}
+
+function anthropicModel({ config, registry }, id) {
+  const capabilities = registry.get(config.models[id].agent).capabilities;
+  return {
+    id,
+    type: "model",
+    display_name: id,
+    created_at: "1970-01-01T00:00:00.000Z",
+    max_input_tokens: 0,
+    max_tokens: 0,
+    capabilities: {
+      image_input: { supported: capabilities.input.includes("image") },
+      pdf_input: { supported: capabilities.input.includes("file") },
+      code_execution: { supported: capabilities.tools.includes("agent") },
+      structured_outputs: { supported: false },
+    },
+  };
+}
+
+function catalog({ config, registry }, grant) {
+  return {
+    object: "allapi.catalog",
+    limits: {
+      json_body_bytes: MAX_JSON_BYTES,
+      file_upload_bytes: MAX_FILE_BYTES,
+      global_concurrency: config.server.maxConcurrent,
+    },
+    models: grant.models.filter((id) => config.models[id]).map((id) => {
+      const profile = config.models[id];
+      const adapter = registry.get(profile.agent);
+      return {
+        id,
+        agent: profile.agent,
+        source: profile.source,
+        capabilities: adapter.capabilities,
+        protocols: {
+          chat_completions: {
+            supported: true,
+            parameters: CHAT_FIELDS,
+            interactive_approvals: false,
+          },
+          responses: {
+            supported: true,
+            parameters: RESPONSE_FIELDS,
+            interactive_approvals: false,
+          },
+          messages: {
+            supported: true,
+            parameters: MESSAGE_FIELDS,
+            interactive_approvals: false,
+          },
+          native: {
+            supported: Boolean(adapter.capabilities.native),
+            lossless_agent_events: Boolean(adapter.capabilities.native),
+            interactive_approvals: Boolean(adapter.capabilities.approvals),
+          },
+        },
+        unsupported_behavior: "error",
+        usage: adapter.capabilities.usage ? "official_agent_data_only" : "unavailable",
+      };
+    }),
+    workspaces: grant.workspaces.filter((id) => config.workspaces[id]).map((id) => ({
+      id,
+      label: config.workspaces[id].label ?? id,
+    })),
+  };
+}
+
+function responseEnvelope(record, status, text, usage, toolCalls = []) {
+  return {
+    id: record.id,
+    object: "response",
+    created_at: record.createdAt,
+    status,
+    model: record.model,
+    output: text === undefined ? [] : [
+      ...(text ? [{
+        ...responseMessage(record, text, "completed"),
+      }] : []),
+      ...toolCalls.map(responseToolCall),
+    ],
+    parallel_tool_calls: true,
+    error: status === "failed" ? record.error : null,
+    incomplete_details: null,
+    ...(usage && { usage: responseUsage(usage) }),
+  };
+}
+
+function responseMessage(record, text, status) {
+  return {
+    id: `${record.id}_message`,
+    type: "message",
+    status,
+    role: "assistant",
+    content: text ? [{ type: "output_text", text, annotations: [] }] : [],
+  };
+}
+
+function chatInput(messages) {
+  const input = [];
+  const instructions = [];
+  messages.forEach((message, index) => {
+    strictObject(message, ["role", "content", "name", "tool_call_id", "tool_calls"], ["role"]);
+    if (!["system", "developer", "user", "assistant", "tool"].includes(message.role)) {
+      throw new HttpError(400, `Unsupported message role at messages[${index}]`);
+    }
+    if (message.role === "tool") {
+      if (!message.tool_call_id) throw new HttpError(400, `messages[${index}].tool_call_id is required`);
+      input.push({
+        type: "tool_result",
+        id: message.tool_call_id,
+        content: message.content,
+      });
+      return;
+    }
+    const content = message.content == null
+      ? []
+      : openAiContent(message.content, `messages[${index}].content`);
+    if (["system", "developer"].includes(message.role)) {
+      instructions.push(...content.filter((block) => block.type === "text").map((block) => block.text));
+      if (content.some((block) => block.type !== "text")) {
+        throw new HttpError(400, `${message.role} messages only support text content`);
+      }
+      return;
+    }
+    const calls = (message.tool_calls ?? []).map((call) => ({
+      type: "tool_call",
+      id: call.id,
+      name: call.function?.name,
+      arguments: call.function?.arguments,
+    }));
+    input.push({ type: "text", text: `${message.role.toUpperCase()}:\n` }, ...content, ...calls);
+  });
+  return { input, instructions: instructions.join("\n\n") || undefined };
+}
+
+function responseInput(input) {
+  const blocks = [];
+  if (typeof input === "string") return [...blocks, { type: "text", text: input }];
+  ensureArray(input, "input");
+  for (const [index, item] of input.entries()) {
+    if (item.type === "message") {
+      blocks.push({ type: "text", text: `${item.role.toUpperCase()}:\n` });
+      blocks.push(...openAiContent(item.content, `input[${index}].content`));
+    } else if (item.type === "input_text") {
+      blocks.push({ type: "text", text: item.text });
+    } else if (item.type === "input_image") {
+      blocks.push(imageBlock(item.image_url ?? item.file_id, `input[${index}]`));
+    } else if (item.type === "input_file") {
+      blocks.push({ type: "file", path: item.file_id ?? item.file_url });
+    } else if (item.type === "function_call") {
+      blocks.push({
+        type: "tool_call",
+        id: item.call_id,
+        name: item.name,
+        arguments: item.arguments,
+      });
+    } else if (item.type === "function_call_output") {
+      blocks.push({ type: "tool_result", id: item.call_id, content: item.output });
+    } else {
+      throw new HttpError(400, `Unsupported input item type: '${item.type}'`);
+    }
+  }
+  return blocks;
+}
+
+function anthropicInput(messages, system) {
+  const blocks = [];
+  let instructions;
+  if (system) {
+    instructions = typeof system === "string"
+      ? system
+      : system.map((block) => block.text ?? "").join("\n");
+  }
+  for (const [index, message] of messages.entries()) {
+    strictObject(message, ["role", "content"], ["role", "content"]);
+    if (!["user", "assistant"].includes(message.role)) {
+      throw new HttpError(400, `Unsupported role at messages[${index}]`);
+    }
+    blocks.push({ type: "text", text: `${message.role.toUpperCase()}:\n` });
+    if (typeof message.content === "string") {
+      blocks.push({ type: "text", text: message.content });
+      continue;
+    }
+    ensureArray(message.content, `messages[${index}].content`);
+    for (const block of message.content) {
+      if (block.type === "text") blocks.push({ type: "text", text: block.text });
+      else if (block.type === "image") {
+        if (block.source?.type === "url") blocks.push(imageBlock(block.source.url, "image"));
+        else if (block.source?.type === "base64") {
+          blocks.push(imageBlock(`data:${block.source.media_type};base64,${block.source.data}`, "image"));
+        } else throw new HttpError(400, "Unsupported Anthropic image source");
+      } else if (block.type === "document") {
+        blocks.push({ type: "file", path: block.source?.file_id ?? block.source?.url });
+      } else if (block.type === "tool_use") {
+        blocks.push({
+          type: "tool_call",
+          id: block.id,
+          name: block.name,
+          arguments: block.input,
+        });
+      } else if (block.type === "tool_result") {
+        blocks.push({ type: "tool_result", id: block.tool_use_id, content: block.content });
+      } else {
+        throw new HttpError(400, `Unsupported Anthropic content block: '${block.type}'`);
+      }
+    }
+  }
+  return { input: blocks, instructions };
+}
+
+function openAiContent(content, field) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  ensureArray(content, field);
+  return content.map((block) => {
+    if (block.type === "text" || block.type === "input_text") {
+      return { type: "text", text: block.text };
+    }
+    if (block.type === "image_url") {
+      return imageBlock(typeof block.image_url === "string" ? block.image_url : block.image_url?.url, field);
+    }
+    if (block.type === "input_image") return imageBlock(block.image_url ?? block.file_id, field);
+    if (block.type === "file" || block.type === "input_file") {
+      return { type: "file", path: block.file?.file_id ?? block.file_id ?? block.file_url };
+    }
+    throw new HttpError(400, `Unsupported content type: '${block.type}'`);
+  });
+}
+
+function imageBlock(value, field) {
+  if (typeof value !== "string" || !value) throw new HttpError(400, `${field} image source is required`);
+  return value.startsWith("file_")
+    ? { type: "file", path: value }
+    : { type: "image_url", url: value };
+}
+
+function validateOpenAiTools(tools) {
+  if (tools === undefined) return [];
+  ensureArray(tools, "tools");
+  return tools.map((tool, index) => {
+    strictObject(tool, ["type", "function"], ["type", "function"]);
+    if (tool.type !== "function") throw new HttpError(400, `Unsupported tool type at tools[${index}]`);
+    return tool;
+  });
+}
+
+function validateResponseTools(tools) {
+  if (tools === undefined) return [];
+  ensureArray(tools, "tools");
+  return tools.map((tool, index) => {
+    strictObject(tool, ["type", "name", "description", "parameters", "strict"], ["type", "name", "parameters"]);
+    if (tool.type !== "function") throw new HttpError(400, `Unsupported tool type at tools[${index}]`);
+    return tool;
+  });
+}
+
+function validateAnthropicTools(tools) {
+  if (tools === undefined) return [];
+  ensureArray(tools, "tools");
+  return tools.map((tool) => strictObject(tool, [
+    "name", "description", "input_schema", "input_examples", "strict",
+  ], ["name", "input_schema"]));
+}
+
+function assertCapabilities(capabilities, input, tools) {
+  if (input.some((block) => block.type === "tool_call" || block.type === "tool_result")
+    && !capabilities.tools.includes("client")) {
+    throw new HttpError(400, "Selected model cannot continue client tool calls", "unsupported_feature");
+  }
+  for (const block of input) {
+    const kind = block.type === "image_url" || block.type === "local_image"
+      ? "image"
+      : block.type === "file" ? "file" : "text";
+    if (!capabilities.input.includes(kind)) {
+      throw new HttpError(400, `Selected model does not support ${kind} input`, "unsupported_feature");
+    }
+  }
+  if (tools.length && !capabilities.tools.includes("client")) {
+    throw new HttpError(400, "Selected model does not support client tools", "unsupported_feature");
+  }
+}
+
+async function resolveInputBlock(block, files, owner) {
+  if (block.type === "file" && block.path?.startsWith("file_")) {
+    const file = files.require(block.path, owner);
+    return file.mediaType.startsWith("image/")
+      ? { type: "local_image", path: file.path, mediaType: file.mediaType }
+      : { ...block, path: file.path, mediaType: file.mediaType };
+  }
+  if (block.type === "image_url") {
+    if (block.url.startsWith("data:")) return block;
+    await assertSafeRemoteUrl(block.url);
+  }
+  if (block.type === "file" && /^https:\/\//.test(block.path)) {
+    await assertSafeRemoteUrl(block.path);
+  }
+  if (block.type === "file" && !path.isAbsolute(block.path ?? "") && !/^https:\/\//.test(block.path ?? "")) {
+    throw new HttpError(400, "File inputs must use an uploaded file_id or HTTPS URL");
+  }
+  return block;
+}
+
+async function collect(events) {
+  let text = "";
+  let usage;
+  let sessionId;
+  const toolCalls = [];
+  for await (const event of events) {
+    if (event.type === "text.delta") text += event.delta;
+    else if (event.type === "completed") {
+      usage = event.usage;
+      sessionId = event.sessionId;
+    } else if (event.type === "client.tool") toolCalls.push(event);
+  }
+  return { text, usage, sessionId, toolCalls };
+}
+
+async function* releaseWhenDone(events, release) {
+  try {
+    yield* events;
+  } finally {
+    release();
+  }
+}
+
+function bearerOrApiKey(request) {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) return authorization.slice(7);
+  if (typeof request.headers["x-api-key"] === "string") return request.headers["x-api-key"];
+  throw new HttpError(401, "Missing API key", "invalid_api_key");
+}
+
+function requireAnthropicVersion(request) {
+  if (!request.headers["anthropic-version"]) {
+    throw new HttpError(400, "anthropic-version header is required");
+  }
+}
+
+function workspaceId(request, grant) {
+  return request.headers["x-allapi-workspace"] || defaultWorkspace(grant);
+}
+
+function defaultWorkspace(grant) {
+  if (grant.workspaces.length === 1) return grant.workspaces[0];
+  throw new HttpError(400, "x-allapi-workspace is required when a key grants multiple workspaces");
+}
+
+async function readJson(request) {
+  const contentType = request.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().startsWith("application/json")) {
+    throw new HttpError(415, "content-type must be application/json");
+  }
+  const body = await readBuffer(request, MAX_JSON_BYTES);
+  try {
+    return JSON.parse(body.toString("utf8"));
+  } catch {
+    throw new HttpError(400, "Invalid JSON body");
+  }
+}
+
+async function readBuffer(request, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > limit) throw new HttpError(413, `Request body exceeds ${limit} bytes`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function sendJson(response, status, value) {
+  if (response.destroyed) return;
+  const body = JSON.stringify(value);
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+function sendError(response, error, anthropic) {
+  if (response.destroyed) return;
+  const status = Number.isInteger(error.status) ? error.status : 500;
+  const message = status === 500 ? "Internal server error" : error.message;
+  if (response.headersSent) {
+    writeIfOpen(response, `${anthropic ? "event: error\n" : ""}data: ${JSON.stringify({
+      type: "error",
+      error: { type: error.code ?? "server_error", message },
+    })}\n\n`);
+    return response.end();
+  }
+  if (anthropic) {
+    return sendJson(response, status, {
+      type: "error",
+      error: {
+        type: anthropicErrorType(status, error.code),
+        message,
+      },
+      request_id: `req_${crypto.randomUUID().replaceAll("-", "")}`,
+    });
+  }
+  return sendJson(response, status, {
+    error: {
+      message,
+      type: error.code ?? "server_error",
+      param: error.parameter ?? null,
+      code: error.code ?? null,
+    },
+  });
+}
+
+function startSse(response) {
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+}
+
+function sendSse(response, value, event) {
+  writeIfOpen(response, `${event ? `event: ${event}\n` : ""}data: ${JSON.stringify(value)}\n\n`);
+}
+
+function writeIfOpen(response, data) {
+  if (!response.destroyed && !response.writableEnded) response.write(data);
+}
+
+function openAiUsage(usage) {
+  return {
+    prompt_tokens: usage.input_tokens,
+    completion_tokens: usage.output_tokens,
+    total_tokens: usage.input_tokens + usage.output_tokens,
+  };
+}
+
+function responseUsage(usage) {
+  return {
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    total_tokens: usage.input_tokens + usage.output_tokens,
+  };
+}
+
+function openAiToolCall(event) {
+  return {
+    id: event.id,
+    type: "function",
+    function: {
+      name: event.name,
+      arguments: typeof event.arguments === "string"
+        ? event.arguments
+        : JSON.stringify(event.arguments),
+    },
+  };
+}
+
+function responseToolCall(event) {
+  return {
+    id: event.id,
+    type: "function_call",
+    status: "completed",
+    call_id: event.id,
+    name: event.name,
+    arguments: typeof event.arguments === "string"
+      ? event.arguments
+      : JSON.stringify(event.arguments),
+  };
+}
+
+function parseToolArguments(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { value };
+  }
+}
+
+function anthropicErrorType(status, code) {
+  if (status === 401) return "authentication_error";
+  if (status === 403) return "permission_error";
+  if (status === 404) return "not_found_error";
+  if (status === 429) return "rate_limit_error";
+  return status >= 500 ? "api_error" : "invalid_request_error";
+}
+
+function ensureArray(value, field) {
+  if (!Array.isArray(value)) throw new HttpError(400, `'${field}' must be an array`, "invalid_request_error", field);
+}
+
+function safeFilename(filename) {
+  return String(filename).replaceAll(/["\r\n]/g, "_");
+}
+
+function anthropicFile(file) {
+  return {
+    id: file.id,
+    type: "file",
+    filename: file.filename,
+    mime_type: file.mediaType ?? "application/octet-stream",
+    size_bytes: file.bytes,
+    created_at: new Date(file.created_at * 1000).toISOString(),
+    downloadable: false,
+  };
+}
+
+export async function assertSafeRemoteUrl(rawUrl) {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== "https:") throw new HttpError(400, "Remote attachments require HTTPS");
+  const addresses = await lookup(parsed.hostname, { all: true, verbatim: true });
+  if (addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new HttpError(400, "Remote attachment URL resolves to a private address");
+  }
+  return parsed;
+}
+
+function isPrivateAddress(address) {
+  return address === "::1"
+    || address.startsWith("fc")
+    || address.startsWith("fd")
+    || address.startsWith("fe80:")
+    || address.startsWith("::ffff:127.")
+    || address.startsWith("::ffff:10.")
+    || address.startsWith("::ffff:192.168.")
+    || address.startsWith("127.")
+    || address.startsWith("10.")
+    || address.startsWith("192.168.")
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(address)
+    || address === "0.0.0.0";
+}

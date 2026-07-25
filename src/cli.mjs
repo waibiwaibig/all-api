@@ -1,892 +1,429 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, openSync } from "node:fs";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import readline from "node:readline/promises";
-import http from "node:http";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { adminEndpoint, adminRequest, createAdminServer } from "./admin.mjs";
+import { createDefaultRegistry } from "./agents.mjs";
+import { ConfigStore, createAccessKey } from "./core.mjs";
+import {
+  configureCloudflare,
+  detectAgents,
+  installAgent,
+  setAutostart,
+  startExposure,
+  stopExposure,
+  updateAgent,
+} from "./platform.mjs";
+import { createAllApiServer } from "./server.mjs";
 
-const DEFAULT_DIR = join(homedir(), ".all-api");
-const DEFAULT_CONFIG = join(DEFAULT_DIR, "config.json");
-const DEFAULT_PORT = 4011;
-const MAX_BODY_BYTES = 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
-const LOCAL_AGENT_TYPES = new Set(["codex", "claude"]);
-const localAgentRuns = new Map();
+const cliPath = fileURLToPath(import.meta.url);
+const dataDirectory = path.resolve(process.env.ALL_API_HOME ?? path.join(homedir(), ".all-api"));
+const configPath = path.join(dataDirectory, "config.json");
+const endpoint = adminEndpoint(dataDirectory);
+const store = new ConfigStore(configPath);
 
-class HttpError extends Error {
-  constructor(status, message, type = "server_error") {
-    super(message);
-    this.status = status;
-    this.type = type;
+if (process.argv[1] && path.resolve(process.argv[1]) === cliPath) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(`all-api: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+export async function main(argv) {
+  const { positional, options } = parseArgs(argv);
+  const [command = "help", subject, action] = positional;
+  if (command === "help" || options.help) return printHelp();
+  if (command === "init") return initialize(options);
+  if (command === "serve") return serve();
+  if (command === "up") return startBackground();
+  if (command === "down") return output(await managementCall("server.shutdown"));
+  if (command === "status") return status();
+  if (command === "detect") return output(await detectAgents());
+
+  if (command === "models") return output((await managementCall("catalog")).models);
+  if (command === "workspaces") return output((await managementCall("catalog")).workspaces);
+  if (command === "keys") return output(await managementCall("key.list"));
+  if (command === "connectors") return output((await managementCall("catalog")).connectors);
+
+  if (command === "model" && subject === "put") {
+    const id = required(positional[2], "model id");
+    const source = options.source ?? "local";
+    return output(await managementCall("profile.put", {
+      id,
+      profile: {
+        agent: required(options.agent, "--agent"),
+        source,
+        ...(source === "managed"
+          ? { overrides: jsonOption(options.overrides ?? "{}", "--overrides") }
+          : {}),
+      },
+    }));
+  }
+  if (command === "model" && subject === "delete") {
+    return output(await managementCall("profile.delete", { id: required(positional[2], "model id") }));
+  }
+  if (command === "workspace" && subject === "add") {
+    return output(await managementCall("workspace.put", {
+      id: required(positional[2], "workspace id"),
+      workspace: {
+        path: path.resolve(required(positional[3], "workspace path")),
+        ...(options.label ? { label: options.label } : {}),
+      },
+    }));
+  }
+  if (command === "workspace" && subject === "remove") {
+    return output(await managementCall("workspace.delete", {
+      id: required(positional[2], "workspace id"),
+    }));
+  }
+  if (command === "key" && subject === "create") {
+    const catalog = await managementCall("catalog");
+    return output(await managementCall("key.create", {
+      name: required(positional[2], "key name"),
+      models: csv(options.models) ?? catalog.models.map((model) => model.id),
+      workspaces: csv(options.workspaces) ?? catalog.workspaces.map((workspace) => workspace.id),
+    }));
+  }
+  if (command === "key" && subject === "revoke") {
+    return output(await managementCall("key.revoke", { id: required(positional[2], "key id") }));
+  }
+  if (command === "connector" && subject === "put") {
+    return output(await managementCall("connector.put", {
+      id: required(positional[2], "connector id"),
+      connector: {
+        command: path.resolve(required(options.command, "--command")),
+        args: jsonOption(options.args ?? "[]", "--args"),
+        capabilities: jsonOption(required(options.capabilities, "--capabilities"), "--capabilities"),
+      },
+    }));
+  }
+  if (command === "connector" && subject === "delete") {
+    return output(await managementCall("connector.delete", {
+      id: required(positional[2], "connector id"),
+    }));
+  }
+  if (command === "agent" && subject === "detect") return output(await detectAgents());
+  if (command === "agent" && subject === "install") {
+    return output(await installAgent(required(positional[2], "agent name")));
+  }
+  if (command === "agent" && subject === "update") {
+    return output(await updateAgent(required(positional[2], "agent name")));
+  }
+  if (command === "autostart" && ["on", "off"].includes(subject)) {
+    return output(await setAutostart({
+      enabled: subject === "on",
+      dataDirectory,
+      cliPath,
+    }));
+  }
+  if (command === "expose") return expose(subject, action, options);
+  throw new Error(`Unknown command. Run "all-api help".`);
+}
+
+async function initialize(options) {
+  try {
+    await access(configPath);
+    throw new Error(`${configPath} already exists; delete it explicitly to replace the configuration`);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const agents = await detectAgents();
+  const installed = agents.filter((agent) => agent.installed);
+  const models = Object.fromEntries(installed.map((agent) => [
+    agent.name,
+    { agent: agent.name, source: "local" },
+  ]));
+  const workspacePath = path.resolve(options.workspace ?? process.cwd());
+  const config = {
+    version: 2,
+    server: { host: "127.0.0.1", port: numberOption(options.port, 8787), maxConcurrent: 4 },
+    models,
+    workspaces: { default: { path: workspacePath, label: path.basename(workspacePath) } },
+    keys: {},
+    connectors: {},
+  };
+  let token;
+  if (installed.length) {
+    const created = await createAccessKey({
+      name: "default",
+      models: Object.keys(models),
+      workspaces: ["default"],
+    });
+    token = created.token;
+    config.keys[created.record.id] = created.record;
+  }
+  await store.save(config);
+  output({
+    initialized: configPath,
+    agents,
+    models: Object.keys(models),
+    workspace: workspacePath,
+    ...(token ? { key: token } : {
+      warning: "No supported Agent is installed; install one, add its model, then create a key",
+    }),
+  });
+}
+
+async function serve() {
+  let config = await store.load();
+  const registry = createDefaultRegistry(config);
+  const app = await createAllApiServer({ config, registry, dataDirectory });
+  let closing = false;
+  let admin;
+
+  const shutdown = async () => {
+    if (closing) return;
+    closing = true;
+    await admin?.close();
+    await app.close();
+  };
+  const actions = {
+    "agent.detect": () => detectAgents(),
+    "agent.install": ({ name }) => installAgent(name),
+    "agent.update": ({ name }) => updateAgent(name),
+    "autostart.set": ({ enabled }) => setAutostart({
+      enabled: Boolean(enabled),
+      dataDirectory,
+      cliPath,
+    }),
+    "exposure.cloudflare.configure": (params, current) => configureCloudflare({
+      dataDirectory,
+      name: params.name,
+      hostname: params.hostname,
+      localPort: current.server.port,
+    }),
+    "exposure.start": (params, current) => startExposure(params.provider, {
+      ...params,
+      dataDirectory,
+      localPort: current.server.port,
+    }),
+    "exposure.stop": (params) => stopExposure(params.provider, { ...params, dataDirectory }),
+    "server.shutdown": () => {
+      setImmediate(() => shutdown().then(() => process.exit(0)));
+      return { stopping: true };
+    },
+  };
+  admin = await createAdminServer({
+    endpoint,
+    getConfig: () => config,
+    async saveConfig(next) {
+      await store.save(next);
+      for (const key of Object.keys(config)) delete config[key];
+      Object.assign(config, structuredClone(next));
+    },
+    actions,
+  });
+  const address = await app.listen();
+  console.log(`All API listening at http://${address.address}:${address.port}`);
+  console.log(`Local management: ${endpoint}`);
+  process.once("SIGINT", () => shutdown().then(() => process.exit(0)));
+  process.once("SIGTERM", () => shutdown().then(() => process.exit(0)));
+}
+
+async function startBackground() {
+  await store.load();
+  try {
+    const health = await fetchLocalHealth();
+    if (health.status === "ok") return output({ running: true, alreadyRunning: true });
+  } catch {}
+  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+  const logPath = path.join(dataDirectory, "server.log");
+  const log = openSync(logPath, "a", 0o600);
+  const child = spawn(process.execPath, [cliPath, "serve"], {
+    detached: true,
+    stdio: ["ignore", log, log],
+    env: process.env,
+    windowsHide: true,
+  });
+  child.unref();
+  closeSync(log);
+  await writeFile(path.join(dataDirectory, "server.pid"), `${child.pid}\n`, { mode: 0o600 });
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await delay(100);
+    try {
+      if ((await fetchLocalHealth()).status === "ok") {
+        return output({ running: true, pid: child.pid, log: logPath });
+      }
+    } catch {}
+  }
+  throw new Error(`Server did not become healthy; inspect ${logPath}`);
+}
+
+async function status() {
+  const config = await store.load();
+  let server = { running: false };
+  try {
+    server = { running: true, ...(await fetchLocalHealth(config)) };
+  } catch {}
+  output({ server, agents: await detectAgents(), config: configPath });
+}
+
+async function expose(provider, action, options) {
+  if (provider === "direct" && ["on", "off"].includes(action)) {
+    return output(await managementCall("server.update", {
+      host: action === "on" ? "0.0.0.0" : "127.0.0.1",
+    }));
+  }
+  if (provider === "cloudflare" && action === "setup") {
+    const config = await store.load();
+    return output(await configureCloudflare({
+      dataDirectory,
+      name: options.name ?? "all-api",
+      hostname: required(options.hostname, "--hostname"),
+      localPort: config.server.port,
+    }));
+  }
+  if (["cloudflare", "tailscale", "relay"].includes(provider) && action === "start") {
+    const config = await store.load();
+    return output(await startExposure(provider, {
+      dataDirectory,
+      localPort: config.server.port,
+      name: options.name,
+      configPath: options.config,
+      host: options.host,
+      remotePort: options["remote-port"] ? numberOption(options["remote-port"]) : undefined,
+    }));
+  }
+  if (["cloudflare", "tailscale", "relay"].includes(provider) && action === "stop") {
+    return output(await stopExposure(provider, { dataDirectory }));
+  }
+  throw new Error("Unknown exposure command");
+}
+
+async function managementCall(method, params, options) {
+  try {
+    return await adminRequest(endpoint, method, params, options);
+  } catch (error) {
+    if (!["ENOENT", "ECONNREFUSED", "EPIPE"].includes(error.code)) throw error;
+  }
+  let config = await store.load();
+  const actions = {
+    "agent.detect": () => detectAgents(),
+    "agent.install": ({ name }) => installAgent(name),
+    "agent.update": ({ name }) => updateAgent(name),
+    "autostart.set": ({ enabled }) => setAutostart({
+      enabled: Boolean(enabled), dataDirectory, cliPath,
+    }),
+    "exposure.cloudflare.configure": (value, current) => configureCloudflare({
+      dataDirectory,
+      name: value.name,
+      hostname: value.hostname,
+      localPort: current.server.port,
+    }),
+    "exposure.start": (value, current) => startExposure(value.provider, {
+      ...value, dataDirectory, localPort: current.server.port,
+    }),
+    "exposure.stop": (value) => stopExposure(value.provider, { ...value, dataDirectory }),
+  };
+  const local = await createAdminServer({
+    endpoint,
+    getConfig: () => config,
+    async saveConfig(next) {
+      await store.save(next);
+      config = next;
+    },
+    actions,
+  });
+  try {
+    return await adminRequest(endpoint, method, params, options);
+  } finally {
+    await local.close();
   }
 }
 
-function usage() {
-  console.log(`all-api
+async function fetchLocalHealth(config) {
+  const current = config ?? await store.load();
+  const response = await fetch(`http://127.0.0.1:${current.server.port}/health`, {
+    signal: AbortSignal.timeout(500),
+  });
+  if (!response.ok) throw new Error("Health check failed");
+  return response.json();
+}
 
-Usage:
-  all-api init [--config FILE] [--workspace DIR]
-  all-api setup [--config FILE] [--workspace DIR] [--host HOST] [--port PORT] [--yes]
-  all-api up [--config FILE] [--host HOST] [--port PORT]
-  all-api stop [--config FILE]
-  all-api detect
-  all-api key create [--config FILE] [--models MODEL,MODEL]
+function parseArgs(argv) {
+  const positional = [];
+  const options = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const value = argv[index];
+    if (!value.startsWith("--")) {
+      positional.push(value);
+      continue;
+    }
+    const equals = value.indexOf("=");
+    if (equals > 0) {
+      options[value.slice(2, equals)] = value.slice(equals + 1);
+    } else if (argv[index + 1] && !argv[index + 1].startsWith("--")) {
+      options[value.slice(2)] = argv[++index];
+    } else {
+      options[value.slice(2)] = true;
+    }
+  }
+  return { positional, options };
+}
 
-Examples:
-  all-api init --workspace /path/to/repo
-  all-api setup
-  all-api up
-  all-api stop
-  all-api key create --models codex-local,claude-code
+function printHelp() {
+  console.log(`All API — expose local Agents through standard and native protocols
+
+Setup and service:
+  all-api init [--workspace PATH] [--port 8787]
+  all-api up | serve | status | down
+  all-api autostart on|off
+
+Configuration (local management socket only):
+  all-api models | model put ID --agent NAME [--source local|managed] [--overrides JSON]
+  all-api model delete ID
+  all-api workspaces | workspace add ID PATH [--label TEXT] | workspace remove ID
+  all-api keys | key create NAME [--models a,b] [--workspaces x,y] | key revoke ID
+  all-api connectors | connector put ID --command PATH --capabilities JSON [--args JSON]
+  all-api connector delete ID
+
+Agents and exposure:
+  all-api agent detect|install|update [codex|claude]
+  all-api expose cloudflare setup --hostname api.example.com [--name all-api]
+  all-api expose cloudflare|tailscale start|stop
+  all-api expose relay start --host user@example.com --remote-port 8787
+  all-api expose direct on|off
+
+Public protocols:
+  POST /v1/chat/completions   POST /v1/responses
+  POST /v1/messages           GET/POST /v1/files
+  WS   /v1/native/sessions    GET /allapi/v1/catalog
 `);
 }
 
-function argValue(args, name, fallback = undefined) {
-  const i = args.indexOf(name);
-  if (i === -1) return fallback;
-  return args[i + 1] ?? fallback;
+function output(value) {
+  console.log(JSON.stringify(value, null, 2));
+  return value;
 }
 
-function hasArg(args, name) {
-  return args.includes(name);
+function csv(value) {
+  if (value === undefined) return undefined;
+  return String(value).split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-function ensureDir(path) {
-  mkdirSync(path, { recursive: true });
-}
-
-function randomKey(prefix = "sk-allapi") {
-  return `${prefix}-${randomBytes(24).toString("base64url")}`;
-}
-
-function sha256(value) {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function saveConfig(configPath, config) {
-  ensureDir(dirname(configPath));
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-}
-
-function loadConfig(configPath) {
-  if (!existsSync(configPath)) return null;
-  return JSON.parse(readFileSync(configPath, "utf8"));
-}
-
-function commandExists(command) {
-  return new Promise((resolveExists) => {
-    const child = spawn("sh", ["-lc", `command -v ${shellQuote(command)}`], {
-      stdio: ["ignore", "ignore", "ignore"],
-    });
-    child.on("exit", (code) => resolveExists(code === 0));
-    child.on("error", () => resolveExists(false));
-  });
-}
-
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
-}
-
-function run(command, args, options = {}) {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  return new Promise((resolveRun) => {
-    if (options.signal?.aborted) {
-      resolveRun({ ok: false, code: null, stdout: "", stderr: "Aborted", timedOut: false, aborted: true });
-      return;
-    }
-
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: { ...process.env, ...(options.env ?? {}) },
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let aborted = false;
-    let stopping = false;
-    let settled = false;
-    let killTimer = null;
-    let timer = null;
-
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      options.signal?.removeEventListener("abort", onAbort);
-      cleanupOwnedProcessGroup(child, timedOut || aborted ? "SIGKILL" : "SIGTERM");
-      resolveRun(result);
-    };
-
-    const stopChild = (reason) => {
-      if (stopping) return;
-      stopping = true;
-      if (reason === "timeout") timedOut = true;
-      if (reason === "abort") aborted = true;
-      terminateChild(child, "SIGTERM");
-      killTimer = setTimeout(() => terminateChild(child, "SIGKILL"), 2000);
-      killTimer.unref();
-    };
-
-    const onAbort = () => stopChild("abort");
-    timer = setTimeout(() => {
-      stopChild("timeout");
-    }, timeoutMs);
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) onAbort();
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", (error) => {
-      finish({ ok: false, code: null, stdout, stderr: String(error), timedOut, aborted });
-    });
-    child.on("exit", (code) => {
-      const interrupted = timedOut || aborted;
-      finish({
-        ok: code === 0 && !interrupted,
-        code,
-        stdout,
-        stderr: aborted && !stderr ? "Aborted" : stderr,
-        timedOut,
-        aborted,
-      });
-    });
-
-    if (options.input) child.stdin.end(options.input);
-    else child.stdin.end();
-  });
-}
-
-function terminateChild(child, signal) {
-  if (!child.pid || child.exitCode !== null) return;
-  signalOwnedProcessGroup(child.pid, signal);
-}
-
-function cleanupOwnedProcessGroup(child, signal) {
-  if (!child.pid) return;
-  signalOwnedProcessGroup(child.pid, signal, { fallbackToPid: false });
-}
-
-function signalOwnedProcessGroup(pid, signal, options = {}) {
+function jsonOption(value, name) {
   try {
-    process.kill(-pid, signal);
+    return JSON.parse(value);
   } catch {
-    if (options.fallbackToPid === false) return;
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // Process already exited.
-    }
+    throw new Error(`${name} must be valid JSON`);
   }
 }
 
-async function detectAdapters() {
-  const [codex, claude] = await Promise.all([commandExists("codex"), commandExists("claude")]);
-  const openclaw = await probeOpenAIEndpoint("http://127.0.0.1:18789/v1");
-  const hermes = await probeOpenAIEndpoint("http://127.0.0.1:8642/v1");
-
-  return {
-    codex: { available: codex, command: "codex" },
-    claude: { available: claude, command: "claude" },
-    openclaw: { available: openclaw, baseUrl: "http://127.0.0.1:18789/v1" },
-    hermes: { available: hermes, baseUrl: "http://127.0.0.1:8642/v1" },
-  };
+function numberOption(value, fallback) {
+  if (value === undefined && fallback !== undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) throw new Error(`Invalid port: ${value}`);
+  return parsed;
 }
 
-function probeOpenAIEndpoint(baseUrl) {
-  return new Promise((resolveProbe) => {
-    const req = http.request(`${baseUrl}/models`, { method: "GET", timeout: 800 }, (res) => {
-      res.resume();
-      resolveProbe(res.statusCode >= 200 && res.statusCode < 500);
-    });
-    req.on("error", () => resolveProbe(false));
-    req.on("timeout", () => {
-      req.destroy();
-      resolveProbe(false);
-    });
-    req.end();
-  });
+function required(value, label) {
+  if (value === undefined || value === true || value === "") throw new Error(`${label} is required`);
+  return value;
 }
 
-async function buildInitialConfig(args) {
-  const detected = await detectAdapters();
-  const workspace = resolve(argValue(args, "--workspace", process.cwd()));
-  const models = [];
-
-  if (detected.codex.available) {
-    models.push({
-      id: "codex-local",
-      type: "codex",
-      command: "codex",
-      workspace,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-      maxConcurrent: 1,
-      enabled: true,
-    });
-  }
-
-  if (detected.claude.available) {
-    models.push({
-      id: "claude-code",
-      type: "claude",
-      command: "claude",
-      workspace,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-      maxConcurrent: 1,
-      enabled: true,
-    });
-  }
-
-  if (detected.openclaw.available) {
-    models.push({
-      id: "openclaw",
-      type: "openai-compatible",
-      baseUrl: detected.openclaw.baseUrl,
-      apiKeyEnv: "OPENCLAW_GATEWAY_TOKEN",
-      upstreamModel: "openclaw/default",
-      enabled: true,
-    });
-  }
-
-  if (detected.hermes.available) {
-    models.push({
-      id: "hermes",
-      type: "openai-compatible",
-      baseUrl: detected.hermes.baseUrl,
-      apiKeyEnv: "HERMES_API_SERVER_KEY",
-      upstreamModel: "hermes-agent",
-      enabled: true,
-    });
-  }
-
-  const adminKey = randomKey("sk-allapi-admin");
-  return {
-    host: "127.0.0.1",
-    port: DEFAULT_PORT,
-    keys: [
-      {
-        name: "admin",
-        keyHash: sha256(adminKey),
-        models: ["*"],
-        createdAt: new Date().toISOString(),
-      },
-    ],
-    models,
-    printedKeys: { admin: adminKey },
-  };
-}
-
-async function cmdInit(args) {
-  const configPath = resolve(argValue(args, "--config", DEFAULT_CONFIG));
-  if (existsSync(configPath) && !hasArg(args, "--force")) {
-    console.error(`Config already exists: ${configPath}`);
-    console.error("Use --force to overwrite.");
-    process.exitCode = 1;
-    return;
-  }
-
-  const config = await buildInitialConfig(args);
-  const adminKey = config.printedKeys.admin;
-  delete config.printedKeys;
-  saveConfig(configPath, config);
-
-  console.log(`Created ${configPath}`);
-  printEndpoint(config, adminKey);
-}
-
-async function cmdSetup(args) {
-  const configPath = resolve(argValue(args, "--config", DEFAULT_CONFIG));
-  const nonInteractive = hasArg(args, "--yes") || hasArg(args, "-y") || !process.stdin.isTTY;
-  let config = loadConfig(configPath);
-  let generatedKey = null;
-
-  if (config && !nonInteractive) {
-    const keep = await ask(`Use existing config at ${configPath}?`, "Y");
-    if (!/^n/i.test(keep)) {
-      config.host = argValue(args, "--host", config.host ?? "127.0.0.1");
-      config.port = Number(argValue(args, "--port", config.port ?? DEFAULT_PORT));
-      if (!(await ensureDaemon(configPath, config))) return;
-      printEndpoint(config, null);
-      return;
-    }
-    config = null;
-  }
-
-  if (!config) {
-    const defaults = {
-      workspace: resolve(argValue(args, "--workspace", process.cwd())),
-      host: argValue(args, "--host", "127.0.0.1"),
-      port: String(argValue(args, "--port", DEFAULT_PORT)),
-    };
-
-    const workspace = nonInteractive
-      ? defaults.workspace
-      : resolve(await ask("Workspace directory", defaults.workspace));
-    const host = nonInteractive ? defaults.host : await ask("Host", defaults.host);
-    const port = Number(nonInteractive ? defaults.port : await ask("Port", defaults.port));
-
-    config = await buildInitialConfig(["--workspace", workspace]);
-    generatedKey = config.printedKeys.admin;
-    delete config.printedKeys;
-    config.host = host;
-    config.port = port;
-    saveConfig(configPath, config);
-    console.log(`Created ${configPath}`);
-  }
-
-  if (!(await ensureDaemon(configPath, config))) return;
-  printEndpoint(config, generatedKey);
-}
-
-async function ensureDaemon(configPath, config) {
-  if (await isServerHealthy(config)) return true;
-
-  const pidPath = pidFileForConfig(configPath);
-  const oldPid = readPid(pidPath);
-  if (oldPid && isProcessRunning(oldPid)) {
-    console.error(`A process is already recorded for this config: ${oldPid}`);
-    console.error(`If it is stale, remove ${pidPath}`);
-    process.exitCode = 1;
-    return false;
-  }
-
-  ensureDir(dirname(pidPath));
-  const child = spawn(process.execPath, [
-    realpathSync(fileURLToPath(import.meta.url)),
-    "up",
-    "--config",
-    configPath,
-    "--host",
-    config.host,
-    "--port",
-    String(config.port),
-  ], {
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
-  writeFileSync(pidPath, `${child.pid}\n`, { mode: 0o600 });
-
-  const ready = await waitForHealth(config, 5000);
-  if (!ready) {
-    console.error("Server did not become ready within 5 seconds.");
-    console.error(`PID file: ${pidPath}`);
-    process.exitCode = 1;
-    return false;
-  }
-  return true;
-}
-
-async function waitForHealth(config, timeoutMs) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (await isServerHealthy(config)) return true;
-    await sleep(100);
-  }
-  return false;
-}
-
-function sleep(ms) {
-  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-}
-
-function isServerHealthy(config) {
-  return new Promise((resolveHealth) => {
-    const host = config.host === "0.0.0.0" ? "127.0.0.1" : config.host;
-    const req = http.request(`http://${host}:${config.port}/health`, { method: "GET", timeout: 500 }, (res) => {
-      res.resume();
-      resolveHealth(res.statusCode === 200);
-    });
-    req.on("error", () => resolveHealth(false));
-    req.on("timeout", () => {
-      req.destroy();
-      resolveHealth(false);
-    });
-    req.end();
-  });
-}
-
-function pidFileForConfig(configPath) {
-  return join(dirname(configPath), `server-${sha256(resolve(configPath)).slice(0, 12)}.pid`);
-}
-
-function readPid(pidPath) {
-  if (!existsSync(pidPath)) return null;
-  const pid = Number(readFileSync(pidPath, "utf8").trim());
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-
-function isProcessRunning(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function ask(question, defaultValue) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = await rl.question(`${question} [${defaultValue}]: `);
-    return answer.trim() || defaultValue;
-  } finally {
-    rl.close();
-  }
-}
-
-async function cmdDetect() {
-  const detected = await detectAdapters();
-  console.log(JSON.stringify(detected, null, 2));
-}
-
-async function cmdKeyCreate(args) {
-  const configPath = resolve(argValue(args, "--config", DEFAULT_CONFIG));
-  const config = loadConfig(configPath);
-  if (!config) {
-    console.error(`Missing config: ${configPath}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  const models = argValue(args, "--models", "*").split(",").map((m) => m.trim()).filter(Boolean);
-  const key = randomKey();
-  config.keys.push({
-    name: argValue(args, "--name", `key-${config.keys.length + 1}`),
-    keyHash: sha256(key),
-    models,
-    createdAt: new Date().toISOString(),
-  });
-  saveConfig(configPath, config);
-  console.log(key);
-}
-
-async function cmdUp(args) {
-  const configPath = resolve(argValue(args, "--config", DEFAULT_CONFIG));
-  let config = loadConfig(configPath);
-  let generatedKey = null;
-  if (!config) {
-    config = await buildInitialConfig(args);
-    generatedKey = config.printedKeys.admin;
-    delete config.printedKeys;
-    saveConfig(configPath, config);
-  }
-
-  config.host = argValue(args, "--host", config.host ?? "127.0.0.1");
-  config.port = Number(argValue(args, "--port", config.port ?? DEFAULT_PORT));
-  startServer(config);
-  printEndpoint(config, generatedKey);
-}
-
-async function cmdStop(args) {
-  const configPath = resolve(argValue(args, "--config", DEFAULT_CONFIG));
-  const pidPath = pidFileForConfig(configPath);
-  const pid = readPid(pidPath);
-  if (!pid) {
-    console.log("No all-api server PID found.");
-    return;
-  }
-
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // Already stopped.
-    }
-  }
-  rmSync(pidPath, { force: true });
-  console.log(`Stopped all-api server ${pid}.`);
-}
-
-function printEndpoint(config, key) {
-  const hostForPrint = config.host === "0.0.0.0" ? "localhost" : config.host;
-  console.log("");
-  console.log("OpenAI-compatible endpoint:");
-  console.log(`  http://${hostForPrint}:${config.port}/v1`);
-  if (key) {
-    console.log("");
-    console.log("API key:");
-    console.log(`  ${key}`);
-  }
-  console.log("");
-  console.log("Models:");
-  for (const model of config.models.filter((m) => m.enabled)) {
-    console.log(`  ${model.id}`);
-  }
-  console.log("");
-}
-
-function startServer(config) {
-  const server = http.createServer(async (req, res) => {
-    try {
-      await route(req, res, config);
-    } catch (error) {
-      if (res.destroyed || res.writableEnded) return;
-      sendJson(res, error.status ?? 500, {
-        error: {
-          message: error?.message ?? "Internal server error",
-          type: error?.type ?? "server_error",
-        },
-      });
-    }
-  });
-
-  server.listen(config.port, config.host, () => {});
-}
-
-async function route(req, res, config) {
-  const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
-  const auth = authenticate(req, config);
-  if (!auth.ok) {
-    sendJson(res, 401, { error: { message: "Invalid API key", type: "authentication_error" } });
-    return;
-  }
-
-  if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-    sendJson(res, 200, {
-      object: "list",
-      data: allowedModels(config, auth.key).map((model) => ({
-        id: model.id,
-        object: "model",
-        created: 0,
-        owned_by: "all-api",
-      })),
-    });
-    return;
-  }
-
-  if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
-    const body = await readJsonBody(req);
-    const model = config.models.find((m) => m.enabled && m.id === body.model);
-    if (!model) {
-      sendJson(res, 404, { error: { message: `Unknown model: ${body.model}`, type: "invalid_request_error" } });
-      return;
-    }
-    if (!keyAllowsModel(auth.key, model.id)) {
-      sendJson(res, 403, { error: { message: `API key cannot access model: ${model.id}`, type: "permission_error" } });
-      return;
-    }
-
-    const requestLifetime = createRequestLifetime(req, res);
-    let result;
-    try {
-      result = await complete(model, body, { signal: requestLifetime.signal });
-    } finally {
-      requestLifetime.cleanup();
-    }
-    if (requestLifetime.signal.aborted || res.destroyed || res.writableEnded) return;
-    sendJson(res, 200, result);
-    return;
-  }
-
-  sendJson(res, 404, { error: { message: "Not found", type: "invalid_request_error" } });
-}
-
-function createRequestLifetime(req, res) {
-  const controller = new AbortController();
-  const abort = () => {
-    if (!res.writableEnded) controller.abort();
-  };
-  req.on("aborted", abort);
-  res.on("close", abort);
-  return {
-    signal: controller.signal,
-    cleanup() {
-      req.off("aborted", abort);
-      res.off("close", abort);
-    },
-  };
-}
-
-function authenticate(req, config) {
-  const header = req.headers.authorization ?? "";
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) return { ok: false };
-  const hash = sha256(match[1]);
-  const found = config.keys.find((key) => safeEqual(key.keyHash, hash));
-  if (!found) return { ok: false };
-  return { ok: true, key: found };
-}
-
-function safeEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function allowedModels(config, key) {
-  return config.models.filter((model) => model.enabled && keyAllowsModel(key, model.id));
-}
-
-function keyAllowsModel(key, modelId) {
-  return key.models.includes("*") || key.models.includes(modelId);
-}
-
-function readJsonBody(req) {
-  return new Promise((resolveBody, rejectBody) => {
-    let size = 0;
-    let data = "";
-    req.setEncoding("utf8");
-    req.on("data", (chunk) => {
-      size += Buffer.byteLength(chunk);
-      if (size > MAX_BODY_BYTES) {
-        rejectBody(new Error("Request body too large"));
-        req.destroy();
-        return;
-      }
-      data += chunk;
-    });
-    req.on("end", () => {
-      try {
-        resolveBody(data ? JSON.parse(data) : {});
-      } catch {
-        rejectBody(new Error("Invalid JSON body"));
-      }
-    });
-    req.on("error", rejectBody);
-  });
-}
-
-async function complete(model, body, options = {}) {
-  const release = LOCAL_AGENT_TYPES.has(model.type) ? acquireLocalAgentSlot(model) : null;
-  try {
-    if (model.type === "codex") return await completeWithCodex(model, body, options);
-    if (model.type === "claude") return await completeWithClaude(model, body, options);
-    if (model.type === "openai-compatible") return await completeWithOpenAICompatible(model, body, options);
-  } finally {
-    release?.();
-  }
-  throw new Error(`Unsupported model type: ${model.type}`);
-}
-
-function acquireLocalAgentSlot(model) {
-  const maxConcurrent = Math.max(1, Number(model.maxConcurrent ?? 1) || 1);
-  const current = localAgentRuns.get(model.id) ?? 0;
-  if (current >= maxConcurrent) {
-    throw new HttpError(
-      429,
-      `${model.id} is busy. all-api keeps local ${model.type} runs to ${maxConcurrent} at a time so repeated hotkeys do not pile up agent processes.`,
-      "rate_limit_error",
-    );
-  }
-  localAgentRuns.set(model.id, current + 1);
-  return () => {
-    const next = (localAgentRuns.get(model.id) ?? 1) - 1;
-    if (next > 0) localAgentRuns.set(model.id, next);
-    else localAgentRuns.delete(model.id);
-  };
-}
-
-async function completeWithCodex(model, body, options = {}) {
-  const prompt = messagesToPrompt(body.messages);
-  const result = await run(model.command ?? "codex", [
-    "exec",
-    "--json",
-    "--ephemeral",
-    "--skip-git-repo-check",
-    "--sandbox",
-    "read-only",
-    "--cd",
-    model.workspace ?? process.cwd(),
-    prompt,
-  ], { timeoutMs: model.timeoutMs, signal: options.signal });
-
-  if (!result.ok) throw new Error(result.stderr || `codex exited with code ${result.code}`);
-  return chatCompletion(body.model, extractCodexText(result.stdout));
-}
-
-async function completeWithClaude(model, body, options = {}) {
-  const prompt = messagesToPrompt(body.messages);
-  const result = await run(model.command ?? "claude", [
-    "-p",
-    prompt,
-    "--output-format",
-    "json",
-    "--no-session-persistence",
-    "--permission-mode",
-    "plan",
-  ], {
-    cwd: model.workspace ?? process.cwd(),
-    timeoutMs: model.timeoutMs,
-    signal: options.signal,
-  });
-
-  if (!result.ok) throw new Error(result.stderr || `claude exited with code ${result.code}`);
-  return chatCompletion(body.model, extractClaudeText(result.stdout));
-}
-
-async function completeWithOpenAICompatible(model, body, options = {}) {
-  const url = new URL(`${model.baseUrl.replace(/\/$/, "")}/chat/completions`);
-  const upstreamBody = {
-    ...body,
-    model: model.upstreamModel ?? body.model,
-  };
-  delete upstreamBody.user;
-
-  const headers = {
-    "content-type": "application/json",
-  };
-  const apiKey = model.apiKeyEnv ? process.env[model.apiKeyEnv] : model.apiKey;
-  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(upstreamBody),
-    signal: options.signal,
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(text || `upstream returned ${response.status}`);
-  return JSON.parse(text);
-}
-
-function messagesToPrompt(messages = []) {
-  return messages.map((message) => {
-    const role = message.role ?? "user";
-    const content = normalizeContent(message.content);
-    return `${role.toUpperCase()}:\n${content}`;
-  }).join("\n\n");
-}
-
-function normalizeContent(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (typeof part === "string") return part;
-      if (part?.type === "text") return part.text ?? "";
-      return JSON.stringify(part);
-    }).join("\n");
-  }
-  return content == null ? "" : JSON.stringify(content);
-}
-
-function extractCodexText(stdout) {
-  let lastText = "";
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      const candidate = findText(event);
-      if (candidate) lastText = candidate;
-    } catch {
-      lastText = line;
-    }
-  }
-  return lastText || stdout.trim();
-}
-
-function extractClaudeText(stdout) {
-  try {
-    const parsed = JSON.parse(stdout);
-    return parsed.result ?? parsed.response ?? parsed.content ?? findText(parsed) ?? stdout.trim();
-  } catch {
-    return stdout.trim();
-  }
-}
-
-function findText(value) {
-  if (!value || typeof value !== "object") return "";
-  if (typeof value.text === "string") return value.text;
-  if (typeof value.content === "string") return value.content;
-  if (typeof value.message === "string") return value.message;
-  if (Array.isArray(value.content)) {
-    const text = value.content.map(findText).filter(Boolean).join("\n");
-    if (text) return text;
-  }
-  for (const item of Object.values(value)) {
-    const text = Array.isArray(item)
-      ? item.map(findText).filter(Boolean).join("\n")
-      : findText(item);
-    if (text) return text;
-  }
-  return "";
-}
-
-function chatCompletion(model, content) {
-  return {
-    id: `chatcmpl-${randomBytes(12).toString("hex")}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content,
-        },
-        finish_reason: "stop",
-      },
-    ],
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
-  };
-}
-
-function sendJson(res, status, value) {
-  const body = JSON.stringify(value);
-  res.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-export {
-  acquireLocalAgentSlot,
-  chatCompletion,
-  extractClaudeText,
-  extractCodexText,
-  run,
-  messagesToPrompt,
-};
-
-async function main(args = process.argv.slice(2)) {
-  const command = args[0];
-
-  if (!command || hasArg(args, "--help") || hasArg(args, "-h")) {
-    usage();
-  } else if (command === "init") {
-    await cmdInit(args.slice(1));
-  } else if (command === "setup") {
-    await cmdSetup(args.slice(1));
-  } else if (command === "up") {
-    await cmdUp(args.slice(1));
-  } else if (command === "stop") {
-    await cmdStop(args.slice(1));
-  } else if (command === "detect") {
-    await cmdDetect();
-  } else if (command === "key" && args[1] === "create") {
-    await cmdKeyCreate(args.slice(2));
-  } else {
-    usage();
-    process.exitCode = 1;
-  }
-}
-
-if (process.argv[1] && realpathSync(resolve(process.argv[1])) === fileURLToPath(import.meta.url)) {
-  await main();
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
