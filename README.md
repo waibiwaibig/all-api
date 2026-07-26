@@ -47,9 +47,9 @@ all-api autostart on
 
 | 用途 | 接口 | 输入输出 |
 |---|---|---|
-| OpenAI 旧生态 | `POST /v1/chat/completions` | Chat Completions |
-| OpenAI 新生态 | `POST /v1/responses` | Responses |
-| Anthropic 生态 | `POST /v1/messages` | Messages |
+| OpenAI 旧生态 | `POST /v1/chat/completions` | 回答和必要的交互文字 |
+| OpenAI 新生态 | `POST /v1/responses` | 回答和 Agent 过程事件文字 |
+| Anthropic 生态 | `POST /v1/messages` | 回答和必要的交互文字 |
 | 完整 Agent 能力 | `WS /v1/native/sessions?model=…` | Agent 官方机器消息原样帧 |
 | 模型发现 | `GET /v1/models` | 按请求头返回 OpenAI 或 Anthropic 形状 |
 | 文件 | `/v1/files` | 按请求头返回 OpenAI 或 Anthropic 形状 |
@@ -60,7 +60,10 @@ all-api autostart on
 `tool_choice`、工具调用和工具结果会完整写入文字上下文；All API 不把它们注册
 为 Agent 原生工具，也不构造客户端 function-calling 循环。交互审批会作为完整
 文字返回并结束该轮；需要真正响应审批的客户端使用 Native。
-无法结构化表达的 Agent 过程事件也会作为带完整 JSON 的文字返回，不会静默丢弃。
+Chat Completions 和 Messages 忽略普通 Agent 过程事件，只返回回答和必要的交互
+文字。Responses 默认把无法结构化表达的 Agent 过程事件作为带完整 JSON 的文字
+返回；可在配置中设置 `server.responsesIncludeProcessEvents: false` 只保留回答。
+能力目录用每个协议的 `agent_process_events` 公开这一差异。Native 始终原样传输。
 
 Anthropic 必填的 `max_tokens` 会被接收以保持客户端可调用，但 Coding Agent
 没有对应的输出 token 上限；能力目录会明确返回
@@ -207,7 +210,8 @@ Cloudflare/SSH 只有在子进程稳定启动后才记录成功；重复启动�
   Agent 会话；Native 直接使用 Agent 会话。
 - Agent 是对话历史的唯一事实来源。为实现 Responses 原生查询，All API 保存
   自己已经返回的最终标准 Response（output、usage、状态）和 Agent 会话映射，
-  不保存输入、原生执行过程或 Agent 对话副本。默认保留30天。
+  不保存输入、原始 Agent 帧或 Agent 对话副本。启用 Responses 过程事件时，其
+  文字投影属于最终标准 output，也会随 Response 保存。默认保留30天。
 - Responses 的 `store:false` 不保存这条 Response，因此之后不能查询或作为
   `previous_response_id` 使用。
 - 明确上传的 Files 保存在本机、按 Key 隔离，直到调用者删除。

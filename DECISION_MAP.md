@@ -99,7 +99,11 @@ sequenceDiagram
 - 调用方 tools 只作为带明确标记的文字上下文交给 Agent。
 - All API 不注册 Agent 原生工具、不暂停等待客户端工具结果、不解析 Agent
   文本猜测 tool call，也不构造 function-calling 循环。
-- Agent 的结构化过程事件如果标准协议没有对应含义，转成包含完整 JSON 的文字。
+- Chat Completions 和 Messages 忽略普通 Agent 过程事件，只返回回答和必要的
+  交互文字。
+- Responses 默认把无法结构化表达的 Agent 过程事件转成包含完整 JSON 的文字；
+  `server.responsesIncludeProcessEvents: false` 可关闭这一行为。
+- 能力目录分别声明 `agent_process_events` 为 `omitted`、`text` 或 `lossless`。
 - 原生过程、真实工具控制和双向交互使用 Native。
 
 ## 7. 审批与交互
@@ -132,9 +136,10 @@ Agent 线程仍是对话事实来源。All API 只为实现 Responses 官方状�
 - Agent thread/session 映射；
 - completed、failed、cancelled 或 incomplete 状态。
 
-不保存请求输入、Agent 原生过程或完整会话副本。默认保留30天，由
-`server.responseRetentionDays` 配置。`store:false` 不落盘，也不能随后查询或
-作为 `previous_response_id`。只有 completed 且有 Agent session 的 Response
+不保存请求输入、原始 Agent 帧或完整会话副本。启用 Responses 过程事件时，
+其文字投影是最终标准 output 的一部分，也会随 Response 保存。默认保留30天，
+由 `server.responseRetentionDays` 配置。`store:false` 不落盘，也不能随后查询
+或作为 `previous_response_id`。只有 completed 且有 Agent session 的 Response
 可以续接。
 
 过期记录由运行中的服务主动删除，不依赖重启或客户端再次查询。
@@ -195,9 +200,11 @@ Agent × Agent/SDK 版本 × 标准接口 × 输入、流式、续接、usage �
 4. Chat usage chunk、Responses 生命周期、Messages content block 顺序符合官方协议。
 5. Codex failed/interrupted 和独立 usage 事件映射正确。
 6. Agent 崩溃、RPC 超时、取消与服务重启都有确定终态且释放并发。
-7. tools 和交互信息完整保留为文字，不产生伪造控制循环。
+7. tools 和交互信息完整保留为文字，不产生伪造控制循环；Chat/Messages 忽略
+   普通过程事件，Responses 按配置保留其文字投影。
 8. 文件不做有损降级，URL 不建立虚假安全边界。
 9. Access/Native/本机管理权限严格分离。
 10. 未认证 Agent 版本只开放 Native，能力目录公开原因。
-11. 默认存储不复制输入或 Agent 原生过程；最终标准 Response 按配置过期。
+11. 默认存储不复制输入、原始 Agent 帧或完整会话；Responses 过程事件的文字
+    投影属于最终标准 output，并按配置过期。
 12. 语法检查、离线回归和真实 Agent 认证全部通过。

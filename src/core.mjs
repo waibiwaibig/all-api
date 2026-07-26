@@ -67,8 +67,13 @@ export function validateConfig(config) {
     || !Number.isInteger(config.server.maxNativeBufferedBytes)
     || config.server.maxNativeBufferedBytes < 1
     || !Number.isInteger(config.server.responseRetentionDays)
-    || config.server.responseRetentionDays < 1) {
-    throw new Error("config.server requires host, port 0-65535, and positive concurrency and Native limits");
+    || config.server.responseRetentionDays < 1
+    || (config.server.responsesIncludeProcessEvents !== undefined
+      && typeof config.server.responsesIncludeProcessEvents !== "boolean")) {
+    throw new Error(
+      "config.server requires host, port 0-65535, positive concurrency and Native limits, "
+      + "and an optional boolean responsesIncludeProcessEvents",
+    );
   }
 
   for (const [id, connector] of Object.entries(config.connectors)) {

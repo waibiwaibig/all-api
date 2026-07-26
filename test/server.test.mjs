@@ -20,6 +20,7 @@ async function fixture({
   standardProtocols,
   standardCompletionDelay = 0,
   nativeSendsReady = true,
+  responsesIncludeProcessEvents,
 } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-server-"));
   const { token, record } = await createApiKey({
@@ -107,6 +108,7 @@ async function fixture({
       maxNativeFrameBytes,
       maxNativeBufferedBytes,
       responseRetentionDays: 30,
+      ...(responsesIncludeProcessEvents !== undefined && { responsesIncludeProcessEvents }),
     },
     models: { fixture: { agent: "fixture", source: "local", workspace: "demo" } },
     workspaces: {
@@ -204,8 +206,12 @@ test("model and workspace discovery is filtered by the access key", async () => 
     assert.deepEqual(catalog.workspaces.map((item) => item.id), ["demo"]);
     assert.equal(catalog.models[0].capabilities.native, true);
     assert.equal(catalog.models[0].agent_version, "fixture-1.0");
+    assert.equal(catalog.models[0].protocols.chat_completions.agent_process_events, "omitted");
     assert.equal(catalog.models[0].protocols.responses.client_tools, false);
     assert.equal(catalog.models[0].protocols.responses.tools_as_text, true);
+    assert.equal(catalog.models[0].protocols.responses.agent_process_events, "text");
+    assert.equal(catalog.models[0].protocols.messages.agent_process_events, "omitted");
+    assert.equal(catalog.models[0].protocols.native.agent_process_events, "lossless");
     assert.equal(catalog.models[0].protocols.native.startup_configuration, "model_profile");
     assert.equal(catalog.models[0].protocols.native.frame_configuration, "agent_protocol_only");
     assert.equal(catalog.default_workspace, "demo");
@@ -478,6 +484,88 @@ test("client tools are passed as text and never become a tool-call control loop"
     assert.equal(responseBody.parallel_tool_calls, false);
     assert.equal(responseBody.output[0].type, "message");
     assert.equal(responseBody.output[0].content[0].text, "hello");
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("Chat and Messages return only answers while Responses retains process events as text", async () => {
+  const app = await fixture();
+  const original = app.registry.get("fixture");
+  app.registry.register("fixture", {
+    capabilities: original.capabilities,
+    verifyStandard: original.verifyStandard,
+    async *run() {
+      yield { type: "text.delta", delta: "answer" };
+      yield {
+        type: "agent.event",
+        payload: { method: "mcpServer/startupStatus/updated", params: { status: "ready" } },
+      };
+      yield {
+        type: "completed",
+        sessionId: "process-event-session",
+        usage: { input_tokens: 3, output_tokens: 1 },
+      };
+    },
+    openNative: original.openNative,
+  });
+  try {
+    const chat = await request(app, "/v1/chat/completions", {
+      model: "fixture",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal((await chat.json()).choices[0].message.content, "answer");
+
+    const messages = await request(app, "/v1/messages", {
+      model: "fixture",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "hi" }],
+    }, {
+      authorization: "",
+      "x-api-key": app.token,
+      "anthropic-version": "2023-06-01",
+    });
+    assert.equal((await messages.json()).content[0].text, "answer");
+
+    const response = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "hi",
+    });
+    const responseText = (await response.json()).output[0].content[0].text;
+    assert.match(responseText, /^answer/);
+    assert.match(responseText, /AGENT_EVENT/);
+    assert.match(responseText, /mcpServer\/startupStatus\/updated/);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("Responses process-event text can be disabled by server configuration", async () => {
+  const app = await fixture({ responsesIncludeProcessEvents: false });
+  const original = app.registry.get("fixture");
+  app.registry.register("fixture", {
+    capabilities: original.capabilities,
+    verifyStandard: original.verifyStandard,
+    async *run() {
+      yield { type: "text.delta", delta: "answer" };
+      yield { type: "agent.event", payload: { method: "hook/completed" } };
+      yield {
+        type: "completed",
+        sessionId: "process-event-session",
+        usage: { input_tokens: 3, output_tokens: 1 },
+      };
+    },
+    openNative: original.openNative,
+  });
+  try {
+    const catalog = await (await request(app, "/allapi/v1/catalog")).json();
+    assert.equal(catalog.models[0].protocols.responses.agent_process_events, "omitted");
+
+    const response = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "hi",
+    });
+    assert.equal((await response.json()).output[0].content[0].text, "answer");
   } finally {
     await app.cleanup();
   }

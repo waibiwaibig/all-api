@@ -529,7 +529,8 @@ async function prepareRun(context, grant, modelId, selectedWorkspace, options) {
     tools: [],
     sessionId: options.sessionId,
     signal: controller.signal,
-  })), () => {
+  }), options.protocol === "responses"
+    && config.server.responsesIncludeProcessEvents !== false), () => {
     controllers.delete(controller);
     release();
   });
@@ -1044,6 +1045,7 @@ async function catalog({ config, registry }, grant) {
           parallel_tool_calls_false: true,
           unsupported_parameters: ["metadata", "user"],
           interactive_approvals: false,
+          agent_process_events: "omitted",
         },
         responses: {
           supported: compatibility.protocols?.responses?.status === "verified",
@@ -1053,6 +1055,9 @@ async function catalog({ config, registry }, grant) {
           tool_choice: "text_context_only",
           parallel_tool_calls_false: true,
           interactive_approvals: false,
+          agent_process_events: config.server.responsesIncludeProcessEvents === false
+            ? "omitted"
+            : "text",
         },
         messages: {
           supported: compatibility.protocols?.messages?.status === "verified",
@@ -1063,6 +1068,7 @@ async function catalog({ config, registry }, grant) {
           max_tokens_enforced: false,
           unsupported_parameters: ["metadata", "stop_sequences"],
           interactive_approvals: false,
+          agent_process_events: "omitted",
         },
         native: {
           supported: Boolean(adapter.capabilities.native),
@@ -1076,6 +1082,7 @@ async function catalog({ config, registry }, grant) {
           startup_configuration: "model_profile",
           frame_configuration: "agent_protocol_only",
           workspace_from_frames: Boolean(adapter.native?.workspaceFromFrames),
+          agent_process_events: "lossless",
         },
       },
       unsupported_behavior: "error",
@@ -1366,7 +1373,7 @@ function standardInput(input, toolContext = {}) {
   return blocks;
 }
 
-async function* standardAgentEvents(events) {
+async function* standardAgentEvents(events, includeProcessEvents) {
   for await (const event of events) {
     if (event.type === "text.delta" || event.type === "completed"
       || event.type === "interrupted") {
@@ -1376,7 +1383,7 @@ async function* standardAgentEvents(events) {
         type: "text.delta",
         delta: `\nAGENT_INTERACTION_REQUEST:\n${JSON.stringify(event.payload)}`,
       };
-    } else {
+    } else if (includeProcessEvents) {
       yield { type: "text.delta", delta: `\nAGENT_EVENT:\n${JSON.stringify(event)}` };
     }
   }

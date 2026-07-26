@@ -158,6 +158,7 @@ async function initialize(options) {
       maxNativeFrameBytes: 1_048_576,
       maxNativeBufferedBytes: 4_194_304,
       responseRetentionDays: 30,
+      responsesIncludeProcessEvents: true,
     },
     models,
     workspaces: { default: { path: workspacePath, label: path.basename(workspacePath) } },

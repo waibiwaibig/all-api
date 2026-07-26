@@ -21,6 +21,7 @@ function baseConfig() {
       maxNativeFrameBytes: 1_048_576,
       maxNativeBufferedBytes: 4_194_304,
       responseRetentionDays: 30,
+      responsesIncludeProcessEvents: true,
     },
     models: {
       codex: { agent: "codex", source: "local", workspace: "demo" },
@@ -96,6 +97,10 @@ test("config validation rejects legacy, dangling grants, and scoped native keys"
     models: ["codex"],
   };
   assert.throws(() => validateConfig(nativeConfig), /must not declare grants/i);
+
+  const invalidProcessEvents = baseConfig();
+  invalidProcessEvents.server.responsesIncludeProcessEvents = "yes";
+  assert.throws(() => validateConfig(invalidProcessEvents), /responsesIncludeProcessEvents/i);
 });
 
 test("ConfigStore writes version 4 atomically and never migrates legacy config", async () => {
