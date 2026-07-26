@@ -1,8 +1,8 @@
 # All API
 
 All API 是运行在 Agent 同一台机器上的桥接器。它把本机 Codex、Claude
-以及外部连接器暴露成 OpenAI、Anthropic 和原生协议，同时保留 Agent 自己的
-配置、权限、工具与会话。
+以及外部连接器暴露成 OpenAI、Anthropic 和原生协议，同时让配置、权限、
+工具执行与会话继续由 Agent 自己负责。
 
 ```mermaid
 flowchart LR
@@ -32,7 +32,7 @@ all-api up
 
 `init` 会检测本机 Agent，登记工作目录，并输出只显示一次的 Access Key。
 服务默认只监听 `127.0.0.1:8787`。配置和 Key 哈希保存在 `~/.all-api`；
-可用 `ALL_API_HOME` 改变该目录。0.3 使用配置版本 3，刻意不迁移旧配置。
+可用 `ALL_API_HOME` 改变该目录。0.4 使用配置版本 4，刻意不迁移旧配置。
 
 ```sh
 all-api status
@@ -55,12 +55,16 @@ all-api autostart on
 | 文件 | `/v1/files` | 按请求头返回 OpenAI 或 Anthropic 形状 |
 | 能力与工作区 | `GET /allapi/v1/catalog` | All API 能力目录 |
 
-标准协议是严格兼容层：未知参数和无法准确实现的能力会明确失败，不会被静默
-忽略。调用方函数工具只会在目标 Agent 适配器确实支持完整工具回合时开放；
-交互审批只在 Native 中开放。强制 `tool_choice`、禁止并行工具等无法保证的
-约束会失败。Anthropic 必填的 `max_tokens` 会被接收以保持客户端可调用，但
-Coding Agent 没有对应的输出 token 上限；能力目录会明确返回
-`max_tokens_enforced: false`。
+标准协议是经过认证的兼容层：未知参数和无法准确实现的能力会明确失败，不会被
+静默忽略。Agent 版本或协议未经认证时只开放 Native。调用方传入的 `tools`、
+`tool_choice`、工具调用和工具结果会完整写入文字上下文；All API 不把它们注册
+为 Agent 原生工具，也不构造客户端 function-calling 循环。交互审批会作为完整
+文字返回并结束该轮；需要真正响应审批的客户端使用 Native。
+
+Anthropic 必填的 `max_tokens` 会被接收以保持客户端可调用，但 Coding Agent
+没有对应的输出 token 上限；能力目录会明确返回
+`max_tokens_enforced: false`。为保证 `message_start` 中的 usage 准确，
+Messages SSE 可能先缓冲 Agent 结果再按官方事件顺序输出。
 
 Native 没有 All API 消息格式。WebSocket 建立后，客户端发给 All API 的每一个
 帧就是发给 Agent 官方机器接口的帧；Agent 返回的帧也不加信封。例如 Codex
@@ -117,7 +121,7 @@ all-api model put codex:review \
   --agent codex \
   --workspace work \
   --source managed \
-  --overrides '{"model":"gpt-5.4","approvalPolicy":"never","sandbox":"read-only"}'
+  --overrides '{"thread":{"model":"gpt-5.4","approvalPolicy":"never","sandbox":"read-only"},"turn":{"effort":"high"}}'
 
 all-api key create phone \
   --type access \
@@ -125,7 +129,7 @@ all-api key create phone \
   --workspaces work \
   --default-workspace work
 
-# Native Key 不包含模型、配置或工作区授权；它只用于完整原生连接
+# Native Key 不包含模型、配置或工作区授权；它用于 Native 和只读发现
 all-api key create native-phone --type native
 all-api models
 all-api workspaces
@@ -134,9 +138,9 @@ all-api keys
 
 修改模型配置和创建 Key 是两套接口。Access Key 只选择可用模型、工作区和
 其中一个默认工作区，不携带模型内部参数。Native Key 是独立的高权限凭据，
-能连接本机所有 Native Agent；撤销后，正在使用它的 WebSocket 会立即关闭。
-两类 Key 都不能调用本机管理接口。删除仍被配置或 Access Key 使用的模型或
-工作区会失败。
+能读取全部模型/工作区目录并连接本机所有 Native Agent；撤销后，正在使用它的
+WebSocket 会立即关闭。它不能调用标准执行、文件或管理接口。两类 Key 都不能
+调用本机管理接口。删除仍被配置或 Access Key 使用的模型或工作区会失败。
 
 本机 Agent 配置会在 Agent 下次启动或恢复时自然生效；All API 模型配置的
 修改也只影响之后的新请求或新 Native 连接，不改写已经运行的连接。
@@ -158,6 +162,7 @@ all-api agent update claude
 
 外部连接器通过本地 JSON-lines RPC 加入：实现 `initialize`、`session/start`，
 并用 `session/event` 通知返回标准内部事件；Native 则原样交换连接器消息。
+新连接器默认只开放 Native；经过独立标准协议认证后才能开放兼容接口。
 
 ```sh
 all-api connector put my-agent \
@@ -193,14 +198,16 @@ all-api expose relay start --host user@example.com --remote-port 8787
 
 - Chat Completions 和 Messages 是无状态转换；Responses 用不透明映射续接
   Agent 会话；Native 直接使用 Agent 会话。
-- Agent 是对话历史的唯一事实来源。All API 只保存 Response ID、Agent 会话
-  ID、状态、模型、工作区和官方 usage，不保存提示词或回复正文。
-- Responses 的 `store:false` 不保存这条映射，因此之后不能查询或作为
+- Agent 是对话历史的唯一事实来源。为实现 Responses 原生查询，All API 保存
+  自己已经返回的最终标准 Response（output、usage、状态）和 Agent 会话映射，
+  不保存输入、原生执行过程或 Agent 对话副本。默认保留30天。
+- Responses 的 `store:false` 不保存这条 Response，因此之后不能查询或作为
   `previous_response_id` 使用。
 - 明确上传的 Files 保存在本机、按 Key 隔离，直到调用者删除。
-- HTTP 或 Native 客户端断线不会取消 Agent；只有 Responses cancel 或
-  Native 的官方中断操作会取消。All API 不保存 Native 事件用于重放。
-- 服务崩溃时，进行中的 Response 标记为 `interrupted`，不会自动重放。
+- HTTP 客户端断线不会自动取消标准任务。Native WebSocket 断开会立即关闭对应
+  Agent 子进程并释放连接；Agent 已保存的线程仍可通过官方 resume 能力续接。
+  All API 不保存 Native 事件用于重放。
+- 服务崩溃时，进行中的 Response 标记为 `incomplete`，不会自动重放。
 - usage 只在 Agent 返回真实数据时出现，不估算、不填零。
 - 标准 API 达到并发上限时立即返回 busy；Native 只限制连接数、单帧大小和
   待发送字节，不解析回合，也不建立 All API 自己的排队系统。
@@ -212,7 +219,10 @@ all-api expose relay start --host user@example.com --remote-port 8787
 npm install
 npm run check
 npm test
+npm run test:real-agents
 ```
 
 测试覆盖严格协议、Key/工作区隔离、两种错误方言、Files、Responses 续接、
 Native 原样事件、官方 Agent 接缝、本地管理 socket、断线与显式取消。
+`test:real-agents` 会使用官方 OpenAI/Anthropic SDK 调用当前登录的真实
+Codex/Claude，因此只在执行版本认证时运行。

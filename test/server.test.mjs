@@ -8,12 +8,13 @@ import path from "node:path";
 import { WebSocket } from "ws";
 import { createApiKey } from "../src/core.mjs";
 import { AgentRegistry } from "../src/agents.mjs";
-import { createAllApiServer } from "../src/server.mjs";
+import { createAllApiServer, ResponseStore } from "../src/server.mjs";
 
 async function fixture({
   maxConcurrent = 4,
   maxNativeConnections = 8,
   maxNativeFrameBytes = 1_048_576,
+  standardStatus = "verified",
 } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-server-"));
   const { token, record } = await createApiKey({
@@ -36,10 +37,11 @@ async function fixture({
   });
   const runs = [];
   const nativeInputs = [];
+  const nativeCloses = [];
   const adapter = {
     capabilities: {
       input: ["text", "image", "file"],
-      tools: ["client"],
+      tools: ["agent"],
       approvals: true,
       continuation: true,
       native: true,
@@ -48,23 +50,11 @@ async function fixture({
     async describe() {
       return { version: "fixture-1.0" };
     },
+    async verifyStandard() {
+      return { status: standardStatus, reason: standardStatus === "verified" ? null : "fixture" };
+    },
     async *run(request) {
       runs.push(request);
-      if (request.tools.length) {
-        const tool = request.tools[0].function ?? request.tools[0];
-        yield {
-          type: "client.tool",
-          id: "call_weather",
-          name: tool.name,
-          arguments: { city: "Shanghai" },
-        };
-        yield {
-          type: "completed",
-          sessionId: request.sessionId ?? "agent-session-1",
-          usage: { input_tokens: 3, output_tokens: 2 },
-        };
-        return;
-      }
       yield { type: "text.delta", delta: "hel" };
       yield { type: "text.delta", delta: "lo" };
       yield {
@@ -80,14 +70,16 @@ async function fixture({
           nativeInputs.push({ message: Buffer.from(message), isBinary });
           send(message, isBinary);
         },
-        async close() {},
+        async close() {
+          nativeCloses.push(true);
+        },
       };
     },
   };
   const registry = new AgentRegistry();
   registry.register("fixture", adapter);
   const config = {
-    version: 3,
+    version: 4,
     server: {
       host: "127.0.0.1",
       port: 0,
@@ -95,6 +87,7 @@ async function fixture({
       maxNativeConnections,
       maxNativeFrameBytes,
       maxNativeBufferedBytes: 4_194_304,
+      responseRetentionDays: 30,
     },
     models: { fixture: { agent: "fixture", source: "local", workspace: "demo" } },
     workspaces: {
@@ -129,6 +122,7 @@ async function fixture({
     nativeKeyId: nativeRecord.id,
     runs,
     nativeInputs,
+    nativeCloses,
     directory,
     baseUrl: `http://127.0.0.1:${address.port}`,
     async cleanup() {
@@ -150,6 +144,23 @@ async function request(app, pathname, body, headers = {}) {
   });
 }
 
+test("Response records expire after the configured retention period", () => {
+  let now = 1_700_000_000_000;
+  const store = new ResponseStore(undefined, {
+    retentionDays: 30,
+    now: () => now,
+  });
+  store.create({
+    id: "resp_expiring",
+    keyId: "key_1",
+    model: "fixture",
+    workspace: "demo",
+    persist: true,
+  });
+  now += 30 * 86_400_000 + 1;
+  assert.throws(() => store.require("resp_expiring", "key_1"), /not found/i);
+});
+
 test("model and workspace discovery is filtered by the access key", async () => {
   const app = await fixture();
   try {
@@ -160,7 +171,8 @@ test("model and workspace discovery is filtered by the access key", async () => 
     assert.deepEqual(catalog.workspaces.map((item) => item.id), ["demo"]);
     assert.equal(catalog.models[0].capabilities.native, true);
     assert.equal(catalog.models[0].agent_version, "fixture-1.0");
-    assert.equal(catalog.models[0].protocols.responses.client_tools, true);
+    assert.equal(catalog.models[0].protocols.responses.client_tools, false);
+    assert.equal(catalog.models[0].protocols.responses.tools_as_text, true);
     assert.equal(catalog.default_workspace, "demo");
 
     const anthropic = await request(app, "/v1/models", undefined, {
@@ -171,6 +183,25 @@ test("model and workspace discovery is filtered by the access key", async () => 
     const anthropicModels = await anthropic.json();
     assert.equal(anthropicModels.data[0].type, "model");
     assert.equal(anthropicModels.data[0].capabilities.image_input.supported, true);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("unverified Agent protocols expose Native but reject standard execution", async () => {
+  const app = await fixture({ standardStatus: "unverified" });
+  try {
+    const catalog = await (await request(app, "/allapi/v1/catalog")).json();
+    assert.equal(catalog.models[0].protocols.chat_completions.supported, false);
+    assert.equal(catalog.models[0].standard_compatibility.status, "unverified");
+    assert.equal(catalog.models[0].protocols.native.supported, true);
+
+    const standard = await request(app, "/v1/chat/completions", {
+      model: "fixture",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(standard.status, 409);
+    assert.equal((await standard.json()).error.type, "agent_protocol_unverified");
   } finally {
     await app.cleanup();
   }
@@ -206,16 +237,27 @@ test("Chat Completions is strict, streams officially shaped chunks, and preserve
       model: "fixture",
       messages: [{ role: "user", content: "hi" }],
       stream: true,
+      stream_options: { include_usage: true },
     }, { "x-allapi-workspace": "demo" });
     const text = await streamed.text();
     assert.match(text, /chat\.completion\.chunk/);
     assert.match(text, /data: \[DONE\]/);
+    const chunks = text.split("\n")
+      .filter((line) => line.startsWith("data: {"))
+      .map((line) => JSON.parse(line.slice(6)));
+    assert.deepEqual(chunks.at(-1).choices, []);
+    assert.deepEqual(chunks.at(-1).usage, {
+      prompt_tokens: 3,
+      completion_tokens: 2,
+      total_tokens: 5,
+    });
+    assert.equal(chunks.at(-2).usage, null);
   } finally {
     await app.cleanup();
   }
 });
 
-test("Responses continuation stores only opaque metadata and reuses the agent session", async () => {
+test("Responses retrieval preserves final output and continuation reuses the agent session", async () => {
   const app = await fixture();
   try {
     const first = await request(app, "/v1/responses", {
@@ -225,6 +267,10 @@ test("Responses continuation stores only opaque metadata and reuses the agent se
     const firstBody = await first.json();
     assert.equal(firstBody.object, "response");
     assert.equal(firstBody.output[0].content[0].text, "hello");
+    const retrieved = await request(app, `/v1/responses/${firstBody.id}`);
+    const retrievedBody = await retrieved.json();
+    assert.deepEqual(retrievedBody.output, firstBody.output);
+    assert.deepEqual(retrievedBody.usage, firstBody.usage);
 
     const second = await request(app, "/v1/responses", {
       model: "fixture",
@@ -252,7 +298,7 @@ test("Responses continuation stores only opaque metadata and reuses the agent se
   }
 });
 
-test("client tools use each standard protocol's official output shape", async () => {
+test("client tools are passed as text and never become a tool-call control loop", async () => {
   const app = await fixture();
   try {
     const chat = await request(app, "/v1/chat/completions", {
@@ -266,10 +312,19 @@ test("client tools use each standard protocol's official output shape", async ()
           parameters: { type: "object" },
         },
       }],
+      tool_choice: {
+        type: "function",
+        function: { name: "weather" },
+      },
+      parallel_tool_calls: false,
     }, { "x-allapi-workspace": "demo" });
     const chatBody = await chat.json();
-    assert.equal(chatBody.choices[0].finish_reason, "tool_calls");
-    assert.equal(chatBody.choices[0].message.tool_calls[0].function.name, "weather");
+    assert.equal(chatBody.choices[0].finish_reason, "stop");
+    assert.equal(chatBody.choices[0].message.content, "hello");
+    assert.deepEqual(app.runs[0].tools, []);
+    const toolContext = app.runs[0].input.map((block) => block.text ?? "").join("\n");
+    assert.match(toolContext, /"name":"weather"/);
+    assert.match(toolContext, /"parallel_tool_calls":false/);
 
     const response = await request(app, "/v1/responses", {
       model: "fixture",
@@ -280,23 +335,56 @@ test("client tools use each standard protocol's official output shape", async ()
         description: "Get weather",
         parameters: { type: "object" },
       }],
+      tool_choice: { type: "function", name: "weather" },
     }, { "x-allapi-workspace": "demo" });
     const responseBody = await response.json();
-    assert.equal(responseBody.output[0].type, "function_call");
-    assert.equal(responseBody.output[0].name, "weather");
+    assert.equal(responseBody.output[0].type, "message");
+    assert.equal(responseBody.output[0].content[0].text, "hello");
+  } finally {
+    await app.cleanup();
+  }
+});
 
-    const forced = await request(app, "/v1/responses", {
+test("standard APIs return interactive Agent requests as text without approving them", async () => {
+  const app = await fixture();
+  app.registry.register("fixture", {
+    capabilities: app.registry.get("fixture").capabilities,
+    verifyStandard: app.registry.get("fixture").verifyStandard,
+    async *run() {
+      yield {
+        type: "interaction",
+        payload: {
+          id: "approval-1",
+          method: "item/commandExecution/requestApproval",
+          params: { command: "touch approval.txt", reason: "test" },
+        },
+      };
+      yield {
+        type: "interrupted",
+        sessionId: "approval-session",
+        usage: { input_tokens: 4, output_tokens: 1 },
+      };
+    },
+    openNative: app.registry.get("fixture").openNative,
+  });
+  try {
+    const chat = await request(app, "/v1/chat/completions", {
       model: "fixture",
-      input: "weather",
-      tools: [{
-        type: "function",
-        name: "weather",
-        parameters: { type: "object" },
-      }],
-      tool_choice: { type: "function", name: "weather" },
+      messages: [{ role: "user", content: "do it" }],
     });
-    assert.equal(forced.status, 400);
-    assert.equal((await forced.json()).error.type, "unsupported_feature");
+    const chatBody = await chat.json();
+    assert.equal(chatBody.choices[0].finish_reason, "stop");
+    assert.match(chatBody.choices[0].message.content, /requestApproval/);
+    assert.match(chatBody.choices[0].message.content, /touch approval\.txt/);
+
+    const response = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "do it",
+    });
+    const responseBody = await response.json();
+    assert.equal(responseBody.status, "incomplete");
+    assert.equal(responseBody.incomplete_details.reason, "agent_interrupted");
+    assert.match(responseBody.output[0].content[0].text, /requestApproval/);
   } finally {
     await app.cleanup();
   }
@@ -319,6 +407,30 @@ test("Anthropic Messages uses Anthropic auth and error dialect", async () => {
     assert.equal(body.type, "message");
     assert.equal(body.content[0].text, "hello");
     assert.deepEqual(body.usage, { input_tokens: 3, output_tokens: 2 });
+
+    const streamed = await request(app, "/v1/messages", {
+      model: "fixture",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    }, {
+      authorization: "",
+      "x-api-key": app.token,
+      "anthropic-version": "2023-06-01",
+    });
+    const events = (await streamed.text()).split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)));
+    assert.deepEqual(events.map((event) => event.type), [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop",
+    ]);
+    assert.deepEqual(events[0].message.usage, { input_tokens: 3, output_tokens: 0 });
+    assert.deepEqual(events.at(-2).usage, { output_tokens: 2 });
 
     const bad = await request(app, "/v1/messages", {
       model: "fixture",
@@ -357,6 +469,9 @@ test("native WebSocket forwards each official frame byte-for-byte without an env
     assert.equal(app.nativeInputs[0].message.toString(), official);
     socket.close();
     await once(socket, "close");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(app.nativeCloses.length, 1);
+    assert.equal(app.activity().native, 0);
   } finally {
     await app.cleanup();
   }
@@ -428,6 +543,7 @@ test("HTTP disconnect does not cancel a task", async () => {
   const didStart = new Promise((resolve) => { started = resolve; });
   app.registry.register("fixture", {
     capabilities: app.registry.get("fixture").capabilities,
+    verifyStandard: app.registry.get("fixture").verifyStandard,
     async *run({ signal }) {
       signal.addEventListener("abort", () => { aborted = true; });
       started();
@@ -471,6 +587,7 @@ test("explicit Responses cancellation aborts the owned agent turn", async () => 
   let aborted = false;
   app.registry.register("fixture", {
     capabilities: app.registry.get("fixture").capabilities,
+    verifyStandard: app.registry.get("fixture").verifyStandard,
     async *run({ signal }) {
       await new Promise((resolve) => {
         signal.addEventListener("abort", () => {
@@ -478,6 +595,11 @@ test("explicit Responses cancellation aborts the owned agent turn", async () => 
           resolve();
         }, { once: true });
       });
+      yield {
+        type: "completed",
+        sessionId: "late-session",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
     },
     openNative: app.registry.get("fixture").openNative,
   });
@@ -494,7 +616,47 @@ test("explicit Responses cancellation aborts the owned agent turn", async () => 
     assert.equal((await cancelled.json()).status, "cancelled");
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(aborted, true);
-    await reader.cancel();
+    const retrieved = await request(app, `/v1/responses/${responseId}`);
+    assert.equal((await retrieved.json()).status, "cancelled");
+    let tail = "";
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      tail += new TextDecoder().decode(part.value);
+    }
+    assert.doesNotMatch(tail, /response\.completed/);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("streaming Responses persist an Agent failure as a terminal failed state", async () => {
+  const app = await fixture();
+  app.registry.register("fixture", {
+    capabilities: app.registry.get("fixture").capabilities,
+    verifyStandard: app.registry.get("fixture").verifyStandard,
+    async *run() {
+      yield { type: "text.delta", delta: "partial" };
+      const error = new Error("fixture exploded");
+      error.code = "fixture_failed";
+      throw error;
+    },
+    openNative: app.registry.get("fixture").openNative,
+  });
+  try {
+    const streamed = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "work",
+      stream: true,
+    });
+    const text = await streamed.text();
+    const responseId = JSON.parse(text.match(/data: (.+)\n/)[1]).response.id;
+    assert.match(text, /"type":"error"/);
+
+    const retrieved = await request(app, `/v1/responses/${responseId}`);
+    const body = await retrieved.json();
+    assert.equal(body.status, "failed");
+    assert.equal(body.error.code, "fixture_failed");
   } finally {
     await app.cleanup();
   }
@@ -505,6 +667,7 @@ test("global concurrency fails busy immediately instead of creating an All API q
   let release;
   app.registry.register("fixture", {
     capabilities: app.registry.get("fixture").capabilities,
+    verifyStandard: app.registry.get("fixture").verifyStandard,
     async *run() {
       await new Promise((resolve) => { release = resolve; });
       yield { type: "completed", sessionId: "done" };

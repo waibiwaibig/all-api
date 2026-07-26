@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { query as claudeQuery } from "@anthropic-ai/claude-agent-sdk";
+
+const CERTIFIED_CODEX_VERSION = "0.144.1";
+const CERTIFIED_CLAUDE_VERSION = "2.1.119";
+const CERTIFIED_CLAUDE_SDK_VERSION = "0.3.220";
 
 export class AgentRegistry {
   #adapters = new Map();
@@ -31,7 +36,7 @@ export class AgentRegistry {
 }
 
 export const CODEX_CAPABILITIES = Object.freeze({
-  input: ["text", "image", "file"],
+  input: ["text", "image"],
   tools: ["agent"],
   approvals: true,
   continuation: true,
@@ -53,11 +58,13 @@ export const CLAUDE_CAPABILITIES = Object.freeze({
 export class JsonLinePeer {
   #nextId = 1;
   #pending = new Map();
+  #rpcTimeoutMs;
   #listeners = new Set();
   #rawListeners = new Set();
   #failureListeners = new Set();
 
   constructor(command, args, options = {}) {
+    this.#rpcTimeoutMs = options.rpcTimeoutMs ?? 10_000;
     this.child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -82,6 +89,7 @@ export class JsonLinePeer {
         const pending = this.#pending.get(String(message.id));
         if (pending) {
           this.#pending.delete(String(message.id));
+          clearTimeout(pending.timer);
           message.error ? pending.reject(rpcError(message.error)) : pending.resolve(message.result);
           return;
         }
@@ -94,13 +102,19 @@ export class JsonLinePeer {
       );
       error.exitCode = code;
       error.signal = signal;
-      for (const pending of this.#pending.values()) pending.reject(error);
+      for (const pending of this.#pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(error);
+      }
       this.#pending.clear();
       this.#emit({ type: "transport.exit", code, signal, error: error.message });
       for (const listener of this.#failureListeners) listener(error);
     });
     this.child.once("error", (error) => {
-      for (const pending of this.#pending.values()) pending.reject(error);
+      for (const pending of this.#pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(error);
+      }
       this.#pending.clear();
       for (const listener of this.#failureListeners) listener(error);
     });
@@ -108,8 +122,24 @@ export class JsonLinePeer {
 
   request(method, params = {}) {
     const id = String(this.#nextId++);
-    const promise = new Promise((resolve, reject) => this.#pending.set(id, { resolve, reject }));
-    this.send({ id, method, params });
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        const error = new Error(`Agent RPC timed out after ${this.#rpcTimeoutMs}ms: ${method}`);
+        error.code = "agent_timeout";
+        reject(error);
+      }, this.#rpcTimeoutMs);
+      timer.unref();
+      this.#pending.set(id, { resolve, reject, timer });
+    });
+    try {
+      this.send({ id, method, params });
+    } catch (error) {
+      const pending = this.#pending.get(id);
+      clearTimeout(pending?.timer);
+      this.#pending.delete(id);
+      pending?.reject(error);
+    }
     return promise;
   }
 
@@ -149,10 +179,13 @@ export class JsonLinePeer {
     if (this.child.exitCode !== null || this.child.signalCode !== null) return;
     this.child.stdin.end();
     const exited = new Promise((resolve) => this.child.once("exit", resolve));
-    const timer = setTimeout(() => this.child.kill("SIGTERM"), 500);
-    timer.unref();
+    const terminate = setTimeout(() => this.child.kill("SIGTERM"), 500);
+    const force = setTimeout(() => this.child.kill("SIGKILL"), 2_000);
+    terminate.unref();
+    force.unref();
     await exited;
-    clearTimeout(timer);
+    clearTimeout(terminate);
+    clearTimeout(force);
   }
 
   #emit(message) {
@@ -179,22 +212,28 @@ export class CodexAdapter {
     return this.description ??= executableDescription(this.executable);
   }
 
+  verifyStandard() {
+    return this.standardCompatibility ??= verifyCodexStandard(this.executable, this.describe());
+  }
+
   async *run(request) {
     const peer = new JsonLinePeer(this.executable, this.appServerArgs, {
       cwd: request.workspace.path,
     });
     const queue = eventQueue();
     const off = peer.onMessage(queue.push);
+    const offFailure = peer.onFailure(queue.fail);
     let threadId;
     let turnId;
+    let usage;
     try {
       await peer.request("initialize", {
-        clientInfo: { name: "all-api", title: "All API", version: "0.3.0" },
+        clientInfo: { name: "all-api", title: "All API", version: "0.4.0" },
         capabilities: { experimentalApi: true },
       });
       peer.notify("initialized", {});
       const overrides = request.profile.source === "managed" ? request.profile.overrides : {};
-      const threadOverrides = pick(overrides, CODEX_THREAD_FIELDS);
+      const threadOverrides = { ...(overrides.thread ?? {}) };
       if (request.instructions) {
         threadOverrides.developerInstructions = [
           threadOverrides.developerInstructions,
@@ -215,7 +254,7 @@ export class CodexAdapter {
       const turn = await peer.request("turn/start", {
         threadId,
         input: toCodexInput(request.input),
-        ...pick(overrides, CODEX_TURN_FIELDS),
+        ...(overrides.turn ?? {}),
       });
       turnId = turn.turn.id;
       request.signal?.addEventListener("abort", () => {
@@ -225,33 +264,38 @@ export class CodexAdapter {
       for await (const message of queue) {
         if (message.method === "item/agentMessage/delta") {
           yield { type: "text.delta", delta: message.params.delta };
+        } else if (message.method === "thread/tokenUsage/updated"
+          && message.params.turnId === turnId) {
+          usage = codexUsage(message.params.tokenUsage.last);
         } else if (message.id !== undefined && isInteractiveCodexRequest(message.method)) {
-          peer.send({
-            id: message.id,
-            result: { decision: "decline" },
-          });
-          await peer.request("turn/interrupt", { threadId, turnId }).catch(() => {});
-          throw new Error(
-            `Codex requested interactive input (${message.method}); use the native endpoint or a non-interactive profile`,
-          );
-        } else if (message.method === "turn/completed" && message.params.turn.id === turnId) {
-          const usage = codexUsage(message.params.turn);
-          yield { type: "completed", sessionId: threadId, ...(usage && { usage }) };
+          yield { type: "interaction", payload: message };
+          yield { type: "interrupted", sessionId: threadId, ...(usage && { usage }) };
           return;
-        } else if (message.method === "turn/failed" && message.params.turn.id === turnId) {
-          throw new Error(message.params.turn.error?.message ?? "Codex turn failed");
+        } else if (message.method === "turn/completed" && message.params.turn.id === turnId) {
+          if (message.params.turn.status === "completed") {
+            yield { type: "completed", sessionId: threadId, ...(usage && { usage }) };
+            return;
+          }
+          const error = new Error(
+            message.params.turn.error?.message ?? `Codex turn ${message.params.turn.status}`,
+          );
+          error.code = `turn_${message.params.turn.status}`;
+          throw error;
         }
       }
     } finally {
       off();
+      offFailure();
       queue.end();
       await peer.close();
     }
   }
 
-  async openNative({ send, fail = () => {}, workspace }) {
-    const peer = new JsonLinePeer(this.executable, this.appServerArgs, {
+  async openNative({ send, fail = () => {}, workspace, profile }) {
+    const native = profile?.source === "managed" ? profile.overrides.native ?? {} : {};
+    const peer = new JsonLinePeer(this.executable, native.args ?? this.appServerArgs, {
       cwd: workspace?.path,
+      env: { ...process.env, ...(native.env ?? {}) },
     });
     const offRaw = peer.onRaw((frame) => send(frame, false));
     const offFailure = peer.onFailure(fail);
@@ -286,12 +330,17 @@ export class ClaudeAdapter {
     return this.description ??= executableDescription(this.executable);
   }
 
+  verifyStandard() {
+    return this.standardCompatibility ??= verifyClaudeStandard(this.describe());
+  }
+
   async *run(request) {
     const overrides = request.profile.source === "managed" ? request.profile.overrides : {};
-    const claudeOptions = pick(overrides, CLAUDE_OPTION_FIELDS);
+    const claudeOptions = { ...(overrides.options ?? {}) };
     const systemPrompt = claudeSystemPrompt(claudeOptions.systemPrompt, request.instructions);
     delete claudeOptions.systemPrompt;
     let interactiveRequest;
+    let latestUsage;
     const execution = this.query({
       prompt: await toClaudePrompt(request.input),
       options: {
@@ -302,8 +351,10 @@ export class ClaudeAdapter {
         ...claudeOptions,
         ...(systemPrompt && { systemPrompt }),
         abortController: abortControllerFrom(request.signal),
-        canUseTool: async (toolName) => {
-          interactiveRequest = toolName;
+        canUseTool: async (toolName, input, details) => {
+          const { signal, ...metadata } = details;
+          void signal;
+          interactiveRequest = { toolName, input, ...metadata };
           return {
             behavior: "deny",
             message: "Interactive approval is unavailable on standard HTTP protocols; use native",
@@ -313,18 +364,37 @@ export class ClaudeAdapter {
     });
     let sessionId = request.sessionId;
     for await (const message of execution) {
-      if (interactiveRequest) {
-        throw new Error(
-          `Claude requested interactive approval for "${interactiveRequest}"; use the native endpoint or a non-interactive profile`,
-        );
-      }
       sessionId = message.session_id ?? sessionId;
+      const messageUsage = message.message?.usage ?? message.usage;
+      if (Number.isFinite(messageUsage?.input_tokens)
+        && Number.isFinite(messageUsage?.output_tokens)) {
+        latestUsage = {
+          input_tokens: messageUsage.input_tokens,
+          output_tokens: messageUsage.output_tokens,
+        };
+      }
+      if (interactiveRequest) {
+        yield { type: "interaction", payload: interactiveRequest };
+        yield {
+          type: "interrupted",
+          sessionId,
+          ...(latestUsage && { usage: latestUsage }),
+        };
+        return;
+      }
       if (message.type === "assistant") {
         for (const block of message.message?.content ?? []) {
           if (block.type === "text") yield { type: "text.delta", delta: block.text };
           if (block.type === "tool_use") yield { type: "agent.tool", payload: block };
         }
       } else if (message.type === "result") {
+        if (message.is_error || message.subtype !== "success") {
+          const error = new Error(
+            message.errors?.join("\n") || `Claude execution failed: ${message.subtype}`,
+          );
+          error.code = message.subtype;
+          throw error;
+        }
         yield {
           type: "completed",
           sessionId,
@@ -342,13 +412,10 @@ export class ClaudeAdapter {
   }
 
   async openNative({ send, fail = () => {}, workspace, profile }) {
-    const overrides = profile.source === "managed"
-      ? pick(profile.overrides, CLAUDE_OPTION_FIELDS)
-      : {};
-    const launch = claudeNativeLaunch(overrides);
-    const peer = new JsonLinePeer(this.executable, this.nativeArgs ?? launch.args, {
+    const native = profile.source === "managed" ? profile.overrides.native ?? {} : {};
+    const peer = new JsonLinePeer(this.executable, native.args ?? this.nativeArgs ?? claudeNativeArgs(), {
       cwd: workspace?.path,
-      env: { ...process.env, ...launch.env, CLAUDE_CODE_ENTRYPOINT: "sdk-ts" },
+      env: { ...process.env, ...(native.env ?? {}), CLAUDE_CODE_ENTRYPOINT: "sdk-ts" },
     });
     const offRaw = peer.onRaw((frame) => send(frame, false));
     const offFailure = peer.onFailure(fail);
@@ -380,6 +447,13 @@ export class ConnectorAdapter {
     return { version: this.definition.version ?? null };
   }
 
+  async verifyStandard() {
+    return {
+      status: "unverified",
+      reason: "Custom connectors are Native-only until independently certified",
+    };
+  }
+
   async *run(request) {
     const peer = new JsonLinePeer(this.definition.command, this.definition.args ?? [], {
       cwd: request.workspace.path,
@@ -387,10 +461,11 @@ export class ConnectorAdapter {
     });
     const queue = eventQueue();
     const off = peer.onMessage(queue.push);
+    const offFailure = peer.onFailure(queue.fail);
     try {
       await peer.request("initialize", {
         protocolVersion: 1,
-        client: { name: "all-api", version: "0.3.0" },
+        client: { name: "all-api", version: "0.4.0" },
       });
       const started = await peer.request("session/start", {
         model: request.model,
@@ -409,6 +484,7 @@ export class ConnectorAdapter {
       }
     } finally {
       off();
+      offFailure();
       queue.end();
       await peer.close();
     }
@@ -442,32 +518,13 @@ export function createDefaultRegistry(config) {
   return registry;
 }
 
-const CODEX_THREAD_FIELDS = [
-  "model", "modelProvider", "approvalPolicy", "approvalsReviewer", "sandbox",
-  "baseInstructions", "developerInstructions", "personality", "serviceTier", "config",
-];
-const CODEX_TURN_FIELDS = [
-  "model", "approvalPolicy", "approvalsReviewer", "effort", "sandboxPolicy",
-  "outputSchema", "summary", "personality", "serviceTier",
-];
-const CLAUDE_OPTION_FIELDS = [
-  "model", "permissionMode", "allowDangerouslySkipPermissions", "allowedTools",
-  "disallowedTools", "systemPrompt", "maxTurns", "maxBudgetUsd", "effort",
-  "fallbackModel", "mcpServers", "hooks", "agents", "betas", "env",
-  "supportedDialogKinds",
-];
-
-function pick(source = {}, allowed) {
-  return Object.fromEntries(Object.entries(source).filter(([key]) => allowed.includes(key)));
-}
-
 function toCodexInput(input) {
   const result = [];
   for (const block of normalizeBlocks(input)) {
     if (block.type === "text") result.push({ type: "text", text: block.text });
     else if (block.type === "image_url") result.push({ type: "image", url: block.url });
     else if (block.type === "local_image") result.push({ type: "localImage", path: block.path });
-    else if (block.type === "file") result.push({ type: "text", text: `[File: ${block.path}]` });
+    else if (block.type === "file") throw new Error("Codex app-server does not support generic file input");
   }
   return result;
 }
@@ -519,8 +576,7 @@ function normalizeBlocks(input) {
   return Array.isArray(input) ? input : [];
 }
 
-function codexUsage(turn) {
-  const value = turn.usage ?? turn.tokenUsage;
+function codexUsage(value) {
   if (!value) return undefined;
   const input = value.inputTokens ?? value.input_tokens;
   const output = value.outputTokens ?? value.output_tokens;
@@ -539,22 +595,32 @@ function eventQueue() {
   const values = [];
   const waiters = [];
   let ended = false;
+  let failure;
   return {
     push(value) {
       const waiter = waiters.shift();
-      waiter ? waiter({ value, done: false }) : values.push(value);
+      waiter ? waiter.resolve({ value, done: false }) : values.push(value);
+    },
+    fail(error) {
+      if (ended) return;
+      ended = true;
+      failure = error;
+      values.length = 0;
+      while (waiters.length) waiters.shift().reject(error);
     },
     end() {
+      if (ended) return;
       ended = true;
-      while (waiters.length) waiters.shift()({ done: true });
+      while (waiters.length) waiters.shift().resolve({ done: true });
     },
     [Symbol.asyncIterator]() {
       return this;
     },
     next() {
       if (values.length) return Promise.resolve({ value: values.shift(), done: false });
+      if (failure) return Promise.reject(failure);
       if (ended) return Promise.resolve({ done: true });
-      return new Promise((resolve) => waiters.push(resolve));
+      return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
     },
   };
 }
@@ -608,8 +674,8 @@ function claudeSystemPrompt(configured, requested) {
   };
 }
 
-function claudeNativeLaunch(overrides) {
-  const args = [
+function claudeNativeArgs() {
+  return [
     "-p",
     "--output-format", "stream-json",
     "--verbose",
@@ -617,35 +683,6 @@ function claudeNativeLaunch(overrides) {
     "--permission-prompt-tool", "stdio",
     "--setting-sources=user,project,local",
   ];
-  const values = [
-    ["model", "--model"],
-    ["permissionMode", "--permission-mode"],
-    ["maxTurns", "--max-turns"],
-    ["maxBudgetUsd", "--max-budget-usd"],
-    ["effort", "--effort"],
-    ["fallbackModel", "--fallback-model"],
-  ];
-  for (const [field, flag] of values) {
-    if (overrides[field] !== undefined) args.push(flag, String(overrides[field]));
-  }
-  if (overrides.allowDangerouslySkipPermissions) {
-    args.push("--allow-dangerously-skip-permissions");
-  }
-  if (overrides.allowedTools?.length) args.push("--allowedTools", overrides.allowedTools.join(","));
-  if (overrides.disallowedTools?.length) {
-    args.push("--disallowedTools", overrides.disallowedTools.join(","));
-  }
-  if (overrides.betas?.length) args.push("--betas", overrides.betas.join(","));
-  if (overrides.mcpServers) {
-    args.push("--mcp-config", JSON.stringify({ mcpServers: overrides.mcpServers }));
-  }
-  if (overrides.agents) args.push("--agents", JSON.stringify(overrides.agents));
-  if (typeof overrides.systemPrompt === "string") {
-    args.push("--system-prompt", overrides.systemPrompt);
-  } else if (overrides.systemPrompt?.append) {
-    args.push("--append-system-prompt", overrides.systemPrompt.append);
-  }
-  return { args, env: overrides.env ?? {} };
 }
 
 function executableDescription(command) {
@@ -662,6 +699,107 @@ function executableDescription(command) {
       version: code === 0 ? output.trim() || null : null,
     }));
     const timer = setTimeout(() => child.kill("SIGTERM"), 2_000);
+    timer.unref();
+    child.once("close", () => clearTimeout(timer));
+  });
+}
+
+async function verifyCodexStandard(executable, descriptionPromise) {
+  const description = await descriptionPromise;
+  const version = semanticVersion(description.version);
+  if (version !== CERTIFIED_CODEX_VERSION) {
+    return {
+      status: "unverified",
+      agent_version: version,
+      reason: `Codex ${version ?? "unknown"} is not certified; expected ${CERTIFIED_CODEX_VERSION}`,
+    };
+  }
+  const directory = await mkdtemp(path.join(tmpdir(), "all-api-codex-schema-"));
+  try {
+    const generated = await runProcess(executable, [
+      "app-server", "generate-json-schema", "--out", directory,
+    ], 30_000);
+    if (!generated.ok) {
+      return {
+        status: "unverified",
+        agent_version: version,
+        reason: "Codex app-server schema generation failed",
+      };
+    }
+    const [notifications, completed] = await Promise.all([
+      readFile(path.join(directory, "ServerNotification.json"), "utf8"),
+      readFile(path.join(directory, "v2", "TurnCompletedNotification.json"), "utf8"),
+    ]);
+    if (!notifications.includes('"turn/completed"')
+      || !notifications.includes('"thread/tokenUsage/updated"')
+      || !completed.includes('"failed"')
+      || !completed.includes('"interrupted"')) {
+      return {
+        status: "unverified",
+        agent_version: version,
+        reason: "Codex app-server schema does not match the certified protocol",
+      };
+    }
+    return {
+      status: "verified",
+      agent_version: version,
+      evidence: "official_schema_and_real_sdk_e2e",
+    };
+  } catch (error) {
+    return {
+      status: "unverified",
+      agent_version: version,
+      reason: `Codex protocol check failed: ${error.message}`,
+    };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function verifyClaudeStandard(descriptionPromise) {
+  const description = await descriptionPromise;
+  const version = semanticVersion(description.version);
+  let sdkVersion;
+  try {
+    const manifest = JSON.parse(await readFile(
+      new URL("../node_modules/@anthropic-ai/claude-agent-sdk/package.json", import.meta.url),
+      "utf8",
+    ));
+    sdkVersion = manifest.version;
+  } catch {
+    sdkVersion = null;
+  }
+  if (version !== CERTIFIED_CLAUDE_VERSION || sdkVersion !== CERTIFIED_CLAUDE_SDK_VERSION) {
+    return {
+      status: "unverified",
+      agent_version: version,
+      sdk_version: sdkVersion,
+      reason: `Claude ${version ?? "unknown"} / SDK ${sdkVersion ?? "unknown"} is not certified`,
+    };
+  }
+  return {
+    status: "verified",
+    agent_version: version,
+    sdk_version: sdkVersion,
+    evidence: "official_sdk_and_real_sdk_e2e",
+  };
+}
+
+function semanticVersion(value) {
+  return /\b(\d+\.\d+\.\d+)\b/.exec(value ?? "")?.[1] ?? null;
+}
+
+function runProcess(command, args, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-8_192); });
+    child.once("error", (error) => resolve({ ok: false, error }));
+    child.once("close", (code) => resolve({ ok: code === 0, code, stderr }));
+    const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
     timer.unref();
     child.once("close", () => clearTimeout(timer));
   });

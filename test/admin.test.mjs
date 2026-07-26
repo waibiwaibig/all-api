@@ -12,7 +12,7 @@ import { ConfigStore } from "../src/core.mjs";
 
 function config(workspace) {
   return {
-    version: 3,
+    version: 4,
     server: {
       host: "127.0.0.1",
       port: 8787,
@@ -20,6 +20,7 @@ function config(workspace) {
       maxNativeConnections: 8,
       maxNativeFrameBytes: 1_048_576,
       maxNativeBufferedBytes: 4_194_304,
+      responseRetentionDays: 30,
     },
     models: { codex: { agent: "codex", source: "local", workspace: "demo" } },
     workspaces: { demo: { path: workspace } },
@@ -53,7 +54,9 @@ test("management RPC is local-only and mutates profiles, workspaces, and keys se
         agent: "codex",
         source: "managed",
         workspace: "demo",
-        overrides: { approvalPolicy: "never", sandbox: "read-only" },
+        overrides: {
+          thread: { approvalPolicy: "never", sandbox: "read-only" },
+        },
       },
     });
     const created = await adminRequest(endpoint, "key.create", {

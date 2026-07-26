@@ -22,7 +22,7 @@ test("CLI initializes, starts, reports health, and stops through local managemen
     const configText = await readFile(path.join(directory, "config.json"), "utf8");
     assert.doesNotMatch(configText, /allapi_key_/);
     const saved = JSON.parse(configText);
-    assert.equal(saved.version, 3);
+    assert.equal(saved.version, 4);
     assert.equal(saved.keys[Object.keys(saved.keys)[0]].defaultWorkspace, "default");
 
     const started = await run(["up"], env);

@@ -47,8 +47,8 @@ export class ConfigStore {
 }
 
 export function validateConfig(config) {
-  if (!config || config.version !== 3) {
-    throw new Error("All API config must use version 3; legacy configs are intentionally not migrated");
+  if (!config || config.version !== 4) {
+    throw new Error("All API config must use version 4; legacy configs are intentionally not migrated");
   }
   for (const field of ["models", "workspaces", "keys", "connectors"]) {
     if (!isRecord(config[field])) throw new Error(`config.${field} must be an object`);
@@ -65,7 +65,9 @@ export function validateConfig(config) {
     || !Number.isInteger(config.server.maxNativeFrameBytes)
     || config.server.maxNativeFrameBytes < 1
     || !Number.isInteger(config.server.maxNativeBufferedBytes)
-    || config.server.maxNativeBufferedBytes < 1) {
+    || config.server.maxNativeBufferedBytes < 1
+    || !Number.isInteger(config.server.responseRetentionDays)
+    || config.server.responseRetentionDays < 1) {
     throw new Error("config.server requires host, port 0-65535, and positive concurrency and Native limits");
   }
 
@@ -113,6 +115,7 @@ export function validateConfig(config) {
     if (model.source === "managed" && !isRecord(model.overrides)) {
       throw new Error(`managed model "${id}" must declare overrides`);
     }
+    if (model.source === "managed") validateManagedOverrides(id, model);
     if (typeof model.workspace !== "string" || !config.workspaces[model.workspace]) {
       throw new Error(`model "${id}" uses unknown workspace "${model.workspace}"`);
     }
@@ -156,6 +159,41 @@ export function validateConfig(config) {
     }
   }
   return config;
+}
+
+function validateManagedOverrides(id, model) {
+  if (!["codex", "claude"].includes(model.agent)) return;
+  const allowed = model.agent === "codex"
+    ? ["thread", "turn", "native"]
+    : ["options", "native"];
+  for (const field of Object.keys(model.overrides)) {
+    if (!allowed.includes(field)) {
+      throw new Error(`managed model "${id}" has unknown ${model.agent} override block "${field}"`);
+    }
+  }
+  for (const field of allowed.filter((field) => field !== "native")) {
+    if (model.overrides[field] !== undefined && !isRecord(model.overrides[field])) {
+      throw new Error(`managed model "${id}" overrides.${field} must be an object`);
+    }
+  }
+  const native = model.overrides.native;
+  if (native === undefined) return;
+  if (!isRecord(native)
+    || (native.args !== undefined && (
+      !Array.isArray(native.args)
+      || !native.args.every((value) => typeof value === "string")
+    ))
+    || (native.env !== undefined && (
+      !isRecord(native.env)
+      || !Object.values(native.env).every((value) => typeof value === "string")
+    ))) {
+    throw new Error(`managed model "${id}" overrides.native requires string args and env`);
+  }
+  for (const field of Object.keys(native)) {
+    if (!["args", "env"].includes(field)) {
+      throw new Error(`managed model "${id}" has unknown native override "${field}"`);
+    }
+  }
 }
 
 export async function createApiKey({

@@ -5,11 +5,20 @@ import {
   ClaudeAdapter,
   CodexAdapter,
   ConnectorAdapter,
+  JsonLinePeer,
 } from "../src/agents.mjs";
 
 const fakeCodex = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url));
 const profile = { agent: "fixture", source: "local" };
 const workspace = { id: "demo", path: process.cwd() };
+
+test("JSON-RPC requests time out when an Agent stays silent", async () => {
+  const peer = new JsonLinePeer(process.execPath, [fakeCodex, "--ignore-all"], {
+    rpcTimeoutMs: 25,
+  });
+  await assert.rejects(peer.request("initialize"), /timed out.*initialize/i);
+  await peer.close();
+});
 
 test("Codex adapter speaks app-server JSON-RPC and preserves the thread id", async () => {
   const shim = new CodexAdapter({
@@ -49,6 +58,77 @@ test("Codex native transport passes app-server JSON-RPC frames without an All AP
   await native.close();
 });
 
+test("Codex adapter rejects promptly when app-server exits mid-turn", async () => {
+  const adapter = new CodexAdapter({
+    executable: process.execPath,
+    appServerArgs: [fakeCodex, "--exit-after-turn"],
+  });
+  const run = async () => {
+    for await (const event of adapter.run({
+      model: "codex",
+      profile,
+      workspace,
+      input: [{ type: "text", text: "hello" }],
+      tools: [],
+      signal: new AbortController().signal,
+    })) void event;
+  };
+  await assert.rejects(
+    Promise.race([
+      run(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 500)),
+    ]),
+    /Agent transport exited/,
+  );
+});
+
+test("managed Codex profiles pass official thread and turn params without a whitelist", async () => {
+  const adapter = new CodexAdapter({
+    executable: process.execPath,
+    appServerArgs: [fakeCodex, "--echo-params"],
+  });
+  let output = "";
+  for await (const event of adapter.run({
+    model: "codex",
+    profile: {
+      agent: "codex",
+      source: "managed",
+      overrides: {
+        thread: { futureThreadField: { enabled: true } },
+        turn: { futureTurnField: "native-value" },
+      },
+    },
+    workspace,
+    input: [{ type: "text", text: "hello" }],
+    tools: [],
+    signal: new AbortController().signal,
+  })) {
+    if (event.type === "text.delta") output += event.delta;
+  }
+  assert.match(output, /"futureThreadField":\{"enabled":true\}/);
+  assert.match(output, /"futureTurnField":"native-value"/);
+});
+
+test("Codex adapter surfaces an approval request as information and interrupts the turn", async () => {
+  const adapter = new CodexAdapter({
+    executable: process.execPath,
+    appServerArgs: [fakeCodex, "--request-approval"],
+  });
+  const events = [];
+  for await (const event of adapter.run({
+    model: "codex",
+    profile,
+    workspace,
+    input: "hello",
+    tools: [],
+    signal: new AbortController().signal,
+  })) events.push(event);
+  const interaction = events.find((event) => event.type === "interaction");
+  assert.equal(interaction.payload.method, "item/commandExecution/requestApproval");
+  assert.equal(interaction.payload.params.command, "touch approval.txt");
+  assert.equal(events.at(-1).type, "interrupted");
+});
+
 test("Claude adapter consumes official SDK messages and resumes the SDK session", async () => {
   const calls = [];
   const adapter = new ClaudeAdapter({
@@ -63,6 +143,8 @@ test("Claude adapter consumes official SDK messages and resumes the SDK session"
         };
         yield {
           type: "result",
+          subtype: "success",
+          is_error: false,
           session_id: "claude-session-1",
           usage: { input_tokens: 5, output_tokens: 2 },
         };
@@ -85,6 +167,103 @@ test("Claude adapter consumes official SDK messages and resumes the SDK session"
   assert.equal(calls[0].options.pathToClaudeCodeExecutable, "/usr/local/bin/claude");
   assert.equal(events[0].delta, "official claude");
   assert.equal(events[1].sessionId, "claude-session-1");
+});
+
+test("managed Claude profiles pass official SDK options without a whitelist", async () => {
+  const calls = [];
+  const adapter = new ClaudeAdapter({
+    query(options) {
+      calls.push(options);
+      return (async function* () {
+        yield {
+          type: "result",
+          subtype: "success",
+          session_id: "claude-session-1",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        };
+      })();
+    },
+  });
+  for await (const event of adapter.run({
+    model: "claude",
+    profile: {
+      agent: "claude",
+      source: "managed",
+      overrides: {
+        options: { futureOfficialOption: { enabled: true } },
+      },
+    },
+    workspace,
+    input: "hello",
+    tools: [],
+    signal: new AbortController().signal,
+  })) void event;
+  assert.deepEqual(calls[0].options.futureOfficialOption, { enabled: true });
+});
+
+test("Claude adapter rejects official SDK error results", async () => {
+  const adapter = new ClaudeAdapter({
+    query() {
+      return (async function* () {
+        yield {
+          type: "result",
+          subtype: "error_max_turns",
+          is_error: true,
+          errors: ["Maximum turns reached"],
+          session_id: "claude-session-1",
+          usage: { input_tokens: 5, output_tokens: 2 },
+        };
+      })();
+    },
+  });
+  const run = async () => {
+    for await (const event of adapter.run({
+      model: "claude",
+      profile,
+      workspace,
+      input: "hello",
+      tools: [],
+      signal: new AbortController().signal,
+    })) void event;
+  };
+  await assert.rejects(run(), /Maximum turns reached/);
+});
+
+test("Claude adapter surfaces permission callbacks as information", async () => {
+  const adapter = new ClaudeAdapter({
+    query({ options }) {
+      return (async function* () {
+        await options.canUseTool("Bash", { command: "touch approval.txt" }, {
+          toolUseID: "tool-1",
+          requestId: "request-1",
+          title: "Claude wants to run a command",
+          signal: new AbortController().signal,
+        });
+        yield {
+          type: "assistant",
+          session_id: "claude-session-1",
+          message: {
+            usage: { input_tokens: 4, output_tokens: 1 },
+            content: [],
+          },
+        };
+      })();
+    },
+  });
+  const events = [];
+  for await (const event of adapter.run({
+    model: "claude",
+    profile,
+    workspace,
+    input: "hello",
+    tools: [],
+    signal: new AbortController().signal,
+  })) events.push(event);
+  assert.equal(events[0].type, "interaction");
+  assert.equal(events[0].payload.toolName, "Bash");
+  assert.deepEqual(events[0].payload.input, { command: "touch approval.txt" });
+  assert.equal(events.at(-1).type, "interrupted");
+  assert.deepEqual(events.at(-1).usage, { input_tokens: 4, output_tokens: 1 });
 });
 
 test("Claude native transport forwards official stream-json frames without interpreting controls", async () => {

@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import { createServer } from "node:http";
-import { lookup } from "node:dns/promises";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer } from "ws";
@@ -18,7 +17,9 @@ const MAX_FILE_BYTES = 64 * 1024 * 1024;
 
 export async function createAllApiServer({ config, registry, dataDirectory }) {
   validateConfig(config);
-  const responses = new ResponseStore(path.join(dataDirectory, "responses.json"));
+  const responses = new ResponseStore(path.join(dataDirectory, "responses.json"), {
+    retentionDays: config.server.responseRetentionDays,
+  });
   await responses.load();
   const files = new FileStore(path.join(dataDirectory, "files"));
   await files.load();
@@ -142,16 +143,21 @@ async function chatCompletions(context, grant) {
     optionalBoolean(body.stream_options.include_usage, "stream_options.include_usage");
   }
   rejectUnsupported(body, ["metadata", "user"]);
-  assertParallelTools(body.parallel_tool_calls);
   const converted = chatInput(body.messages);
+  const tools = validateOpenAiTools(body.tools);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
     ...converted,
-    tools: applyOpenAiToolChoice(validateOpenAiTools(body.tools), body.tool_choice),
+    tools,
+    toolContext: {
+      ...(body.tools !== undefined && { tools }),
+      ...(body.tool_choice !== undefined && { tool_choice: body.tool_choice }),
+      ...(body.parallel_tool_calls !== undefined
+        && { parallel_tool_calls: body.parallel_tool_calls }),
+    },
   });
   if (body.stream) {
     startSse(response);
     let roleSent = false;
-    let toolSeen = false;
     for await (const event of run.events) {
       if (event.type === "text.delta") {
         sendSse(response, {
@@ -164,44 +170,28 @@ async function chatCompletions(context, grant) {
             delta: roleSent ? { content: event.delta } : { role: "assistant", content: event.delta },
             finish_reason: null,
           }],
+          ...(body.stream_options?.include_usage && { usage: null }),
         });
         roleSent = true;
-      } else if (event.type === "client.tool") {
-        toolSeen = true;
+      } else if (event.type === "completed" || event.type === "interrupted") {
         sendSse(response, {
           id: run.id,
           object: "chat.completion.chunk",
           created: run.created,
           model: body.model,
-          choices: [{
-            index: 0,
-            delta: {
-              tool_calls: [{
-                index: 0,
-                id: event.id,
-                type: "function",
-                function: {
-                  name: event.name,
-                  arguments: typeof event.arguments === "string"
-                    ? event.arguments
-                    : JSON.stringify(event.arguments),
-                },
-              }],
-            },
-            finish_reason: null,
-          }],
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          ...(body.stream_options?.include_usage && { usage: null }),
         });
-      } else if (event.type === "completed") {
-        sendSse(response, {
-          id: run.id,
-          object: "chat.completion.chunk",
-          created: run.created,
-          model: body.model,
-          choices: [{ index: 0, delta: {}, finish_reason: toolSeen ? "tool_calls" : "stop" }],
-          ...(body.stream_options?.include_usage && event.usage
-            ? { usage: openAiUsage(event.usage) }
-            : {}),
-        });
+        if (body.stream_options?.include_usage && event.usage) {
+          sendSse(response, {
+            id: run.id,
+            object: "chat.completion.chunk",
+            created: run.created,
+            model: body.model,
+            choices: [],
+            usage: openAiUsage(event.usage),
+          });
+        }
       }
     }
     writeIfOpen(response, "data: [DONE]\n\n");
@@ -219,9 +209,8 @@ async function chatCompletions(context, grant) {
       message: {
         role: "assistant",
         content: result.text || null,
-        ...(result.toolCalls.length && { tool_calls: result.toolCalls.map(openAiToolCall) }),
       },
-      finish_reason: result.toolCalls.length ? "tool_calls" : "stop",
+      finish_reason: "stop",
     }],
     ...(result.usage && { usage: openAiUsage(result.usage) }),
   });
@@ -240,17 +229,26 @@ async function createResponse(context, grant) {
   )) {
     throw new HttpError(400, "'metadata' must be an object", "invalid_request_error", "metadata");
   }
-  assertParallelTools(body.parallel_tool_calls);
   const previous = body.previous_response_id
     ? responses.require(body.previous_response_id, grant.keyId)
     : undefined;
+  if (previous && (previous.status !== "completed" || !previous.agentSessionId)) {
+    throw new HttpError(400, "previous_response_id is not a completed resumable response");
+  }
   if (previous && (previous.model !== body.model || previous.workspace !== workspaceId(request, grant))) {
     throw new HttpError(400, "previous_response_id belongs to a different model or workspace");
   }
+  const tools = validateResponseTools(body.tools);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
     input: responseInput(body.input),
     instructions: body.instructions,
-    tools: applyOpenAiToolChoice(validateResponseTools(body.tools), body.tool_choice),
+    tools,
+    toolContext: {
+      ...(body.tools !== undefined && { tools }),
+      ...(body.tool_choice !== undefined && { tool_choice: body.tool_choice }),
+      ...(body.parallel_tool_calls !== undefined
+        && { parallel_tool_calls: body.parallel_tool_calls }),
+    },
     sessionId: previous?.agentSessionId,
   });
   const record = responses.create({
@@ -264,113 +262,115 @@ async function createResponse(context, grant) {
   });
   if (body.stream) {
     startSse(response);
-    let sequence = 0;
-    sendSse(response, {
-      type: "response.created",
-      response: responseEnvelope(record, "in_progress"),
-      sequence_number: sequence++,
-    }, "response.created");
-    sendSse(response, {
-      type: "response.in_progress",
-      response: responseEnvelope(record, "in_progress"),
-      sequence_number: sequence++,
-    }, "response.in_progress");
-    let text = "";
-    let textStarted = false;
-    const toolCalls = [];
-    for await (const event of run.events) {
-      if (event.type === "text.delta") {
-        if (!textStarted) {
-          textStarted = true;
+    try {
+      let sequence = 0;
+      sendSse(response, {
+        type: "response.created",
+        response: responseEnvelope(record, "in_progress"),
+        sequence_number: sequence++,
+      }, "response.created");
+      sendSse(response, {
+        type: "response.in_progress",
+        response: responseEnvelope(record, "in_progress"),
+        sequence_number: sequence++,
+      }, "response.in_progress");
+      let text = "";
+      let textStarted = false;
+      for await (const event of run.events) {
+        if (event.type === "text.delta") {
+          if (!textStarted) {
+            textStarted = true;
+            sendSse(response, {
+              type: "response.output_item.added",
+              output_index: 0,
+              item: responseMessage(record, "", "in_progress"),
+              sequence_number: sequence++,
+            }, "response.output_item.added");
+            sendSse(response, {
+              type: "response.content_part.added",
+              item_id: `${record.id}_message`,
+              output_index: 0,
+              content_index: 0,
+              part: { type: "output_text", text: "", annotations: [] },
+              sequence_number: sequence++,
+            }, "response.content_part.added");
+          }
+          text += event.delta;
           sendSse(response, {
-            type: "response.output_item.added",
-            output_index: 0,
-            item: responseMessage(record, "", "in_progress"),
-            sequence_number: sequence++,
-          }, "response.output_item.added");
-          sendSse(response, {
-            type: "response.content_part.added",
+            type: "response.output_text.delta",
             item_id: `${record.id}_message`,
             output_index: 0,
             content_index: 0,
-            part: { type: "output_text", text: "", annotations: [] },
+            delta: event.delta,
             sequence_number: sequence++,
-          }, "response.content_part.added");
+          }, "response.output_text.delta");
+        } else if (event.type === "completed" || event.type === "interrupted") {
+          if (textStarted) {
+            sendSse(response, {
+              type: "response.output_text.done",
+              item_id: `${record.id}_message`,
+              output_index: 0,
+              content_index: 0,
+              text,
+              sequence_number: sequence++,
+            }, "response.output_text.done");
+            sendSse(response, {
+              type: "response.content_part.done",
+              item_id: `${record.id}_message`,
+              output_index: 0,
+              content_index: 0,
+              part: { type: "output_text", text, annotations: [] },
+              sequence_number: sequence++,
+            }, "response.content_part.done");
+            sendSse(response, {
+              type: "response.output_item.done",
+              output_index: 0,
+              item: responseMessage(record, text, "completed"),
+              sequence_number: sequence++,
+            }, "response.output_item.done");
+          }
+          const output = responseOutput(record, text);
+          const finish = event.type === "completed"
+            ? responses.complete.bind(responses)
+            : responses.interrupt.bind(responses);
+          const didComplete = finish(record.id, {
+            agentSessionId: event.sessionId,
+            usage: event.usage,
+            output,
+          });
+          if (!didComplete) break;
+          const completed = responseEnvelope(record, record.status);
+          const responseEvent = record.status === "completed"
+            ? "response.completed"
+            : "response.incomplete";
+          sendSse(response, {
+            type: responseEvent,
+            response: completed,
+            sequence_number: sequence++,
+          }, responseEvent);
+          if (!record.persist) responses.delete(record.id);
         }
-        text += event.delta;
-        sendSse(response, {
-          type: "response.output_text.delta",
-          item_id: `${record.id}_message`,
-          output_index: 0,
-          content_index: 0,
-          delta: event.delta,
-          sequence_number: sequence++,
-        }, "response.output_text.delta");
-      } else if (event.type === "client.tool") {
-        toolCalls.push(event);
-        const outputIndex = (textStarted ? 1 : 0) + toolCalls.length - 1;
-        sendSse(response, {
-          type: "response.output_item.added",
-          output_index: outputIndex,
-          item: { ...responseToolCall(event), status: "in_progress" },
-          sequence_number: sequence++,
-        }, "response.output_item.added");
-        sendSse(response, {
-          type: "response.output_item.done",
-          output_index: outputIndex,
-          item: responseToolCall(event),
-          sequence_number: sequence++,
-        }, "response.output_item.done");
-      } else if (event.type === "completed") {
-        if (textStarted) {
-          sendSse(response, {
-            type: "response.output_text.done",
-            item_id: `${record.id}_message`,
-            output_index: 0,
-            content_index: 0,
-            text,
-            sequence_number: sequence++,
-          }, "response.output_text.done");
-          sendSse(response, {
-            type: "response.content_part.done",
-            item_id: `${record.id}_message`,
-            output_index: 0,
-            content_index: 0,
-            part: { type: "output_text", text, annotations: [] },
-            sequence_number: sequence++,
-          }, "response.content_part.done");
-          sendSse(response, {
-            type: "response.output_item.done",
-            output_index: 0,
-            item: responseMessage(record, text, "completed"),
-            sequence_number: sequence++,
-          }, "response.output_item.done");
-        }
-        responses.complete(record.id, {
-          agentSessionId: event.sessionId,
-          usage: event.usage,
-        });
-        const completed = responseEnvelope(record, "completed", text, event.usage, toolCalls);
-        sendSse(response, {
-          type: "response.completed",
-          response: completed,
-          sequence_number: sequence++,
-        }, "response.completed");
-        if (!record.persist) responses.delete(record.id);
       }
+      return response.end();
+    } catch (error) {
+      responses.fail(record.id, error);
+      if (!record.persist) responses.delete(record.id);
+      throw error;
     }
-    return response.end();
   }
 
   try {
     const result = await collect(run.events);
-    responses.complete(record.id, {
+    const output = responseOutput(record, result.text);
+    const finish = result.status === "interrupted"
+      ? responses.interrupt.bind(responses)
+      : responses.complete.bind(responses);
+    finish(record.id, {
       agentSessionId: result.sessionId,
       usage: result.usage,
+      output,
     });
-    const resultBody = responseEnvelope(
-      record, "completed", result.text, result.usage, result.toolCalls,
-    );
+    const resultBody = responseEnvelope(record, record.status);
     if (!record.persist) responses.delete(record.id);
     return sendJson(response, 200, resultBody);
   } catch (error) {
@@ -385,8 +385,10 @@ async function responseLifecycle(context, grant, url) {
   const [, , , id, action] = url.pathname.split("/");
   const record = responses.require(id, grant.keyId);
   if (request.method === "POST" && action === "cancel") {
-    responses.cancel(id);
-    return sendJson(response, 200, responseEnvelope(record, "cancelled"));
+    if (!responses.cancel(id)) {
+      throw new HttpError(400, `Response "${id}" is already terminal`, "invalid_request_error");
+    }
+    return sendJson(response, 200, responseEnvelope(record, record.status));
   }
   if (request.method === "DELETE" && !action) {
     responses.delete(id);
@@ -408,12 +410,19 @@ async function messages(context, grant) {
   }
   rejectUnsupported(body, ["metadata", "stop_sequences"]);
   const converted = anthropicInput(body.messages, body.system);
+  const tools = validateAnthropicTools(body.tools);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
     ...converted,
-    tools: applyAnthropicToolChoice(validateAnthropicTools(body.tools), body.tool_choice),
+    tools,
+    toolContext: {
+      ...(body.tools !== undefined && { tools }),
+      ...(body.tool_choice !== undefined && { tool_choice: body.tool_choice }),
+    },
   });
   const messageId = run.id.replace("chatcmpl_", "msg_");
   if (body.stream) {
+    const result = await collect(run.events);
+    requireUsage(result.usage, "Anthropic Messages");
     startSse(response);
     sendSse(response, {
       type: "message_start",
@@ -425,76 +434,41 @@ async function messages(context, grant) {
         model: body.model,
         stop_reason: null,
         stop_sequence: null,
+        usage: { input_tokens: result.usage.input_tokens, output_tokens: 0 },
       },
     }, "message_start");
-    sendSse(response, {
-      type: "content_block_start",
-      index: 0,
-      content_block: { type: "text", text: "" },
-    }, "content_block_start");
-    let contentIndex = 0;
-    let toolSeen = false;
-    for await (const event of run.events) {
-      if (event.type === "text.delta") {
-        sendSse(response, {
-          type: "content_block_delta",
-          index: contentIndex,
-          delta: { type: "text_delta", text: event.delta },
-        }, "content_block_delta");
-      } else if (event.type === "client.tool") {
-        toolSeen = true;
-        contentIndex += 1;
-        sendSse(response, {
-          type: "content_block_start",
-          index: contentIndex,
-          content_block: { type: "tool_use", id: event.id, name: event.name, input: {} },
-        }, "content_block_start");
-        sendSse(response, {
-          type: "content_block_delta",
-          index: contentIndex,
-          delta: {
-            type: "input_json_delta",
-            partial_json: typeof event.arguments === "string"
-              ? event.arguments
-              : JSON.stringify(event.arguments),
-          },
-        }, "content_block_delta");
-        sendSse(response, { type: "content_block_stop", index: contentIndex }, "content_block_stop");
-      } else if (event.type === "completed") {
-        sendSse(response, {
-          type: "content_block_stop",
-          index: 0,
-        }, "content_block_stop");
-        sendSse(response, {
-          type: "message_delta",
-          delta: { stop_reason: toolSeen ? "tool_use" : "end_turn", stop_sequence: null },
-          usage: event.usage ? { output_tokens: event.usage.output_tokens } : {},
-        }, "message_delta");
-        sendSse(response, { type: "message_stop" }, "message_stop");
-      }
+    if (result.text) {
+      sendSse(response, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      }, "content_block_start");
+      sendSse(response, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: result.text },
+      }, "content_block_delta");
+      sendSse(response, { type: "content_block_stop", index: 0 }, "content_block_stop");
     }
+    sendSse(response, {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: result.usage.output_tokens },
+    }, "message_delta");
+    sendSse(response, { type: "message_stop" }, "message_stop");
     return response.end();
   }
   const result = await collect(run.events);
+  requireUsage(result.usage, "Anthropic Messages");
   return sendJson(response, 200, {
     id: messageId,
     type: "message",
     role: "assistant",
-    content: [
-      ...(result.text ? [{ type: "text", text: result.text }] : []),
-      ...result.toolCalls.map((event) => ({
-        type: "tool_use",
-        id: event.id,
-        name: event.name,
-        input: typeof event.arguments === "string"
-          ? parseToolArguments(event.arguments)
-          : event.arguments,
-      })),
-    ],
+    content: result.text ? [{ type: "text", text: result.text }] : [],
     model: body.model,
-    stop_reason: result.toolCalls.length ? "tool_use" : "end_turn",
+    stop_reason: "end_turn",
     stop_sequence: null,
-    ...(result.usage && { usage: result.usage }),
+    usage: result.usage,
   });
 }
 
@@ -508,21 +482,34 @@ async function prepareRun(context, grant, modelId, selectedWorkspace, options) {
   const workspaceConfig = config.workspaces[workspace];
   if (!workspaceConfig) throw new HttpError(404, `Workspace "${workspace}" does not exist`);
   const adapter = registry.get(profile.agent);
-  const input = await Promise.all(options.input.map((block) => resolveInputBlock(block, files, grant.keyId)));
-  assertCapabilities(adapter.capabilities, input, options.tools);
+  const compatibility = await adapter.verifyStandard?.() ?? {
+    status: "unverified",
+    reason: "Agent adapter has no standard protocol certification",
+  };
+  if (compatibility.status !== "verified") {
+    throw new HttpError(
+      409,
+      compatibility.reason ?? "Selected Agent protocol is not verified for standard APIs",
+      "agent_protocol_unverified",
+    );
+  }
+  const textualInput = standardInput(options.input, options.toolContext);
+  const input = await Promise.all(textualInput.map((block) =>
+    resolveInputBlock(block, files, grant.keyId)));
+  assertCapabilities(adapter.capabilities, input);
   const release = gate.acquire();
   const controller = new AbortController();
   controllers.add(controller);
-  const events = releaseWhenDone(adapter.run({
+  const events = releaseWhenDone(standardAgentEvents(adapter.run({
     model: modelId,
     profile,
     workspace: { id: workspace, ...workspaceConfig },
     input,
     instructions: options.instructions,
-    tools: options.tools,
+    tools: [],
     sessionId: options.sessionId,
     signal: controller.signal,
-  }), () => {
+  })), () => {
     controllers.delete(controller);
     release();
   });
@@ -639,6 +626,9 @@ async function handleUpgrade({
       if (code && webSocket.readyState === webSocket.OPEN) webSocket.close(code, reason);
       await current?.close();
     };
+    webSocket.once("close", () => {
+      closeNative().catch(() => {});
+    });
     try {
       nativeSessions.add(closeNative);
       const keyed = nativeSessionsByKey.get(grant.keyId) ?? new Set();
@@ -651,11 +641,11 @@ async function handleUpgrade({
           if (webSocket.readyState !== webSocket.OPEN) return;
           const bytes = Buffer.isBuffer(frame) ? frame.byteLength : Buffer.byteLength(String(frame));
           if (bytes > config.server.maxNativeFrameBytes) {
-            webSocket.close(1009, "Native frame limit exceeded");
+            closeNative(1009, "Native frame limit exceeded").catch(() => {});
             return;
           }
           if (webSocket.bufferedAmount + bytes > config.server.maxNativeBufferedBytes) {
-            webSocket.close(1009, "Native output buffer limit exceeded");
+            closeNative(1009, "Native output buffer limit exceeded").catch(() => {});
             return;
           }
           webSocket.send(frame, { binary: isBinary });
@@ -671,13 +661,11 @@ async function handleUpgrade({
       let incoming = Promise.resolve();
       webSocket.on("message", (data, isBinary) => {
         if (data.byteLength > config.server.maxNativeFrameBytes) {
-          webSocket.close(1009, "Native frame limit exceeded");
+          closeNative(1009, "Native frame limit exceeded").catch(() => {});
           return;
         }
         incoming = incoming.then(() => native.receive(data, isBinary)).catch((error) => {
-          if (webSocket.readyState === webSocket.OPEN) {
-            webSocket.close(1011, String(error?.message ?? error).slice(0, 120));
-          }
+          closeNative(1011, String(error?.message ?? error).slice(0, 120)).catch(() => {});
         });
       });
     } catch (error) {
@@ -690,9 +678,13 @@ async function handleUpgrade({
 export class ResponseStore {
   #records = new Map();
   #saving = Promise.resolve();
+  #retentionMs;
+  #now;
 
-  constructor(filename) {
+  constructor(filename, { retentionDays = 30, now = Date.now } = {}) {
     this.filename = filename;
+    this.#retentionMs = retentionDays * 86_400_000;
+    this.#now = now;
   }
 
   async load() {
@@ -700,7 +692,11 @@ export class ResponseStore {
     try {
       const records = JSON.parse(await readFile(this.filename, "utf8"));
       for (const record of records) {
-        if (record.status === "in_progress") record.status = "interrupted";
+        if (this.#expired(record)) continue;
+        if (record.status === "in_progress") {
+          record.status = "incomplete";
+          record.incompleteDetails = { reason: "server_restarted" };
+        }
         this.#records.set(record.id, record);
       }
       await this.#save();
@@ -710,11 +706,13 @@ export class ResponseStore {
   }
 
   create(record) {
+    const now = this.#now();
     const value = {
       ...record,
       object: "response",
       status: "in_progress",
-      createdAt: Math.floor(Date.now() / 1000),
+      createdAt: Math.floor(now / 1000),
+      expiresAt: Math.floor((now + this.#retentionMs) / 1000),
     };
     this.#records.set(value.id, value);
     this.#save().catch(() => {});
@@ -723,17 +721,32 @@ export class ResponseStore {
 
   complete(id, metadata) {
     const record = this.#records.get(id);
-    if (!record) return;
+    if (!record || record.status !== "in_progress") return false;
     record.status = "completed";
     record.agentSessionId = metadata.agentSessionId;
     record.usage = metadata.usage;
+    record.output = metadata.output ?? [];
     delete record.controller;
     this.#save().catch(() => {});
+    return true;
+  }
+
+  interrupt(id, metadata) {
+    const record = this.#records.get(id);
+    if (!record || record.status !== "in_progress") return false;
+    record.status = "incomplete";
+    record.incompleteDetails = { reason: "agent_interrupted" };
+    record.agentSessionId = metadata.agentSessionId;
+    record.usage = metadata.usage;
+    record.output = metadata.output ?? [];
+    delete record.controller;
+    this.#save().catch(() => {});
+    return true;
   }
 
   fail(id, error) {
     const record = this.#records.get(id);
-    if (!record) return;
+    if (!record || record.status !== "in_progress") return false;
     record.status = "failed";
     record.error = {
       code: error.code ?? "agent_error",
@@ -742,21 +755,28 @@ export class ResponseStore {
     };
     delete record.controller;
     this.#save().catch(() => {});
+    return true;
   }
 
   cancel(id) {
     const record = this.#records.get(id);
+    if (!record || record.status !== "in_progress") return false;
     record?.controller?.abort(new Error("Cancelled by client"));
-    if (record) {
-      record.status = "cancelled";
-      delete record.controller;
-      this.#save().catch(() => {});
-    }
+    record.status = "cancelled";
+    delete record.controller;
+    this.#save().catch(() => {});
+    return true;
   }
 
   require(id, keyId) {
     const record = this.#records.get(id);
-    if (!record || record.keyId !== keyId) throw new HttpError(404, `Response "${id}" not found`, "not_found");
+    if (record && this.#expired(record)) {
+      this.#records.delete(id);
+      this.#save().catch(() => {});
+    }
+    if (!record || this.#expired(record) || record.keyId !== keyId) {
+      throw new HttpError(404, `Response "${id}" not found`, "not_found");
+    }
     return record;
   }
 
@@ -785,6 +805,11 @@ export class ResponseStore {
       await rename(temporary, this.filename);
     });
     return this.#saving;
+  }
+
+  #expired(record) {
+    return Number.isFinite(record.expiresAt)
+      && record.expiresAt <= Math.floor(this.#now() / 1000);
   }
 }
 
@@ -919,8 +944,14 @@ async function catalog({ config, registry }, grant) {
   const models = await Promise.all(visibleModels(config, grant).map(async (id) => {
     const profile = config.models[id];
     const adapter = registry.get(profile.agent);
-    const description = await adapter.describe?.() ?? {};
-    const clientTools = adapter.capabilities.tools.includes("client");
+    const [description, compatibility] = await Promise.all([
+      adapter.describe?.() ?? {},
+      adapter.verifyStandard?.() ?? {
+        status: "unverified",
+        reason: "Agent adapter has no standard protocol certification",
+      },
+    ]);
+    const standardSupported = compatibility.status === "verified";
     return {
       id,
       agent: profile.agent,
@@ -928,29 +959,33 @@ async function catalog({ config, registry }, grant) {
       source: profile.source,
       workspace: profile.workspace ?? null,
       capabilities: adapter.capabilities,
+      standard_compatibility: compatibility,
       protocols: {
         chat_completions: {
-          supported: true,
+          supported: standardSupported,
           parameters: CHAT_FIELDS,
-          client_tools: clientTools,
-          tool_choice: clientTools ? ["auto", "none"] : [],
-          parallel_tool_calls_false: false,
+          client_tools: false,
+          tools_as_text: true,
+          tool_choice: "text_context_only",
+          parallel_tool_calls_false: true,
           unsupported_parameters: ["metadata", "user"],
           interactive_approvals: false,
         },
         responses: {
-          supported: true,
+          supported: standardSupported,
           parameters: RESPONSE_FIELDS,
-          client_tools: clientTools,
-          tool_choice: clientTools ? ["auto", "none"] : [],
-          parallel_tool_calls_false: false,
+          client_tools: false,
+          tools_as_text: true,
+          tool_choice: "text_context_only",
+          parallel_tool_calls_false: true,
           interactive_approvals: false,
         },
         messages: {
-          supported: true,
+          supported: standardSupported,
           parameters: MESSAGE_FIELDS,
-          client_tools: clientTools,
-          tool_choice: clientTools ? ["auto", "none"] : [],
+          client_tools: false,
+          tools_as_text: true,
+          tool_choice: "text_context_only",
           max_tokens_enforced: false,
           unsupported_parameters: ["metadata", "stop_sequences"],
           interactive_approvals: false,
@@ -989,7 +1024,9 @@ async function catalog({ config, registry }, grant) {
   };
 }
 
-function responseEnvelope(record, status, text, usage, toolCalls = []) {
+function responseEnvelope(record, status, text, usage) {
+  const output = text === undefined ? record.output ?? [] : responseOutput(record, text);
+  const finalUsage = usage ?? record.usage;
   return {
     id: record.id,
     object: "response",
@@ -997,17 +1034,16 @@ function responseEnvelope(record, status, text, usage, toolCalls = []) {
     status,
     model: record.model,
     metadata: record.metadata ?? {},
-    output: text === undefined ? [] : [
-      ...(text ? [{
-        ...responseMessage(record, text, "completed"),
-      }] : []),
-      ...toolCalls.map(responseToolCall),
-    ],
+    output,
     parallel_tool_calls: true,
     error: status === "failed" ? record.error : null,
-    incomplete_details: null,
-    ...(usage && { usage: responseUsage(usage) }),
+    incomplete_details: status === "incomplete" ? record.incompleteDetails : null,
+    ...(finalUsage && { usage: responseUsage(finalUsage) }),
   };
+}
+
+function responseOutput(record, text) {
+  return text ? [responseMessage(record, text, "completed")] : [];
 }
 
 function responseMessage(record, text, status) {
@@ -1186,39 +1222,6 @@ function validateAnthropicTools(tools) {
   ], ["name", "input_schema"]));
 }
 
-function applyOpenAiToolChoice(tools, choice) {
-  if (choice === undefined || choice === "auto") return tools;
-  if (choice === "none") return [];
-  throw new HttpError(
-    400,
-    "Forced tool_choice is not supported by Agent compatibility adapters",
-    "unsupported_feature",
-    "tool_choice",
-  );
-}
-
-function applyAnthropicToolChoice(tools, choice) {
-  if (choice === undefined || choice?.type === "auto") return tools;
-  if (choice?.type === "none") return [];
-  throw new HttpError(
-    400,
-    "Forced tool_choice is not supported by Agent compatibility adapters",
-    "unsupported_feature",
-    "tool_choice",
-  );
-}
-
-function assertParallelTools(value) {
-  if (value === false) {
-    throw new HttpError(
-      400,
-      "parallel_tool_calls=false cannot be guaranteed by Agent compatibility adapters",
-      "unsupported_feature",
-      "parallel_tool_calls",
-    );
-  }
-}
-
 function rejectUnsupported(body, fields) {
   for (const field of fields) {
     if (body[field] !== undefined) {
@@ -1238,11 +1241,17 @@ function optionalBoolean(value, field) {
   }
 }
 
-function assertCapabilities(capabilities, input, tools) {
-  if (input.some((block) => block.type === "tool_call" || block.type === "tool_result")
-    && !capabilities.tools.includes("client")) {
-    throw new HttpError(400, "Selected model cannot continue client tool calls", "unsupported_feature");
+function requireUsage(usage, protocol) {
+  if (!Number.isFinite(usage?.input_tokens) || !Number.isFinite(usage?.output_tokens)) {
+    throw new HttpError(
+      502,
+      `${protocol} requires official usage, but the selected Agent did not provide it`,
+      "agent_usage_unavailable",
+    );
   }
+}
+
+function assertCapabilities(capabilities, input) {
   for (const block of input) {
     const kind = block.type === "image_url" || block.type === "local_image"
       ? "image"
@@ -1250,9 +1259,6 @@ function assertCapabilities(capabilities, input, tools) {
     if (!capabilities.input.includes(kind)) {
       throw new HttpError(400, `Selected model does not support ${kind} input`, "unsupported_feature");
     }
-  }
-  if (tools.length && !capabilities.tools.includes("client")) {
-    throw new HttpError(400, "Selected model does not support client tools", "unsupported_feature");
   }
 }
 
@@ -1263,32 +1269,56 @@ async function resolveInputBlock(block, files, owner) {
       ? { type: "local_image", path: file.path, mediaType: file.mediaType }
       : { ...block, path: file.path, mediaType: file.mediaType };
   }
-  if (block.type === "image_url") {
-    if (block.url.startsWith("data:")) return block;
-    await assertSafeRemoteUrl(block.url);
-  }
-  if (block.type === "file" && /^https:\/\//.test(block.path)) {
-    await assertSafeRemoteUrl(block.path);
-  }
   if (block.type === "file" && !path.isAbsolute(block.path ?? "") && !/^https:\/\//.test(block.path ?? "")) {
     throw new HttpError(400, "File inputs must use an uploaded file_id or HTTPS URL");
   }
   return block;
 }
 
+function standardInput(input, toolContext = {}) {
+  const blocks = input.map((block) =>
+    ["tool_call", "tool_result"].includes(block.type)
+      ? { type: "text", text: `STANDARD_API_INPUT:\n${JSON.stringify(block)}` }
+      : block);
+  if (Object.keys(toolContext).length) {
+    blocks.push({
+      type: "text",
+      text: `STANDARD_API_TOOL_CONTEXT:\n${JSON.stringify(toolContext)}`,
+    });
+  }
+  return blocks;
+}
+
+async function* standardAgentEvents(events) {
+  for await (const event of events) {
+    if (event.type === "text.delta" || event.type === "completed"
+      || event.type === "interrupted") {
+      yield event;
+    } else if (event.type === "interaction") {
+      yield {
+        type: "text.delta",
+        delta: `\nAGENT_INTERACTION_REQUEST:\n${JSON.stringify(event.payload)}`,
+      };
+    } else {
+      yield { type: "text.delta", delta: `\nAGENT_EVENT:\n${JSON.stringify(event)}` };
+    }
+  }
+}
+
 async function collect(events) {
   let text = "";
   let usage;
   let sessionId;
-  const toolCalls = [];
+  let status;
   for await (const event of events) {
     if (event.type === "text.delta") text += event.delta;
-    else if (event.type === "completed") {
+    else if (event.type === "completed" || event.type === "interrupted") {
       usage = event.usage;
       sessionId = event.sessionId;
-    } else if (event.type === "client.tool") toolCalls.push(event);
+      status = event.type;
+    }
   }
-  return { text, usage, sessionId, toolCalls };
+  return { text, usage, sessionId, status };
 }
 
 async function* releaseWhenDone(events, release) {
@@ -1464,40 +1494,6 @@ function responseUsage(usage) {
   };
 }
 
-function openAiToolCall(event) {
-  return {
-    id: event.id,
-    type: "function",
-    function: {
-      name: event.name,
-      arguments: typeof event.arguments === "string"
-        ? event.arguments
-        : JSON.stringify(event.arguments),
-    },
-  };
-}
-
-function responseToolCall(event) {
-  return {
-    id: event.id,
-    type: "function_call",
-    status: "completed",
-    call_id: event.id,
-    name: event.name,
-    arguments: typeof event.arguments === "string"
-      ? event.arguments
-      : JSON.stringify(event.arguments),
-  };
-}
-
-function parseToolArguments(value) {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return { value };
-  }
-}
-
 function anthropicErrorType(status, code) {
   if (status === 401) return "authentication_error";
   if (status === 403) return "permission_error";
@@ -1524,29 +1520,4 @@ function anthropicFile(file) {
     created_at: new Date(file.created_at * 1000).toISOString(),
     downloadable: false,
   };
-}
-
-export async function assertSafeRemoteUrl(rawUrl) {
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== "https:") throw new HttpError(400, "Remote attachments require HTTPS");
-  const addresses = await lookup(parsed.hostname, { all: true, verbatim: true });
-  if (addresses.some(({ address }) => isPrivateAddress(address))) {
-    throw new HttpError(400, "Remote attachment URL resolves to a private address");
-  }
-  return parsed;
-}
-
-function isPrivateAddress(address) {
-  return address === "::1"
-    || address.startsWith("fc")
-    || address.startsWith("fd")
-    || address.startsWith("fe80:")
-    || address.startsWith("::ffff:127.")
-    || address.startsWith("::ffff:10.")
-    || address.startsWith("::ffff:192.168.")
-    || address.startsWith("127.")
-    || address.startsWith("10.")
-    || address.startsWith("192.168.")
-    || /^172\.(1[6-9]|2\d|3[01])\./.test(address)
-    || address === "0.0.0.0";
 }

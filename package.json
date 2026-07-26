@@ -1,6 +1,6 @@
 {
   "name": "@waibiwaibig/all-api",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Local bridge exposing coding agents through OpenAI, Anthropic, and native protocols.",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,7 @@
     "start": "node ./src/cli.mjs up",
     "detect": "node ./src/cli.mjs detect",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test:real-agents": "ALL_API_REAL_AGENTS=1 node --test test/real-agents.test.mjs",
     "check": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/agents.mjs && node --check src/admin.mjs && node --check src/platform.mjs"
   },
   "engines": {
@@ -34,5 +35,9 @@
   },
   "overrides": {
     "@hono/node-server": "2.0.11"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "openai": "^6.49.0"
   }
 }

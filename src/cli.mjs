@@ -148,7 +148,7 @@ async function initialize(options) {
   ]));
   const workspacePath = path.resolve(options.workspace ?? process.cwd());
   const config = {
-    version: 3,
+    version: 4,
     server: {
       host: "127.0.0.1",
       port: numberOption(options.port, 8787),
@@ -156,6 +156,7 @@ async function initialize(options) {
       maxNativeConnections: 8,
       maxNativeFrameBytes: 1_048_576,
       maxNativeBufferedBytes: 4_194_304,
+      responseRetentionDays: 30,
     },
     models,
     workspaces: { default: { path: workspacePath, label: path.basename(workspacePath) } },

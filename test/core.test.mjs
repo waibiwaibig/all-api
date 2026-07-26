@@ -12,7 +12,7 @@ import {
 
 function baseConfig() {
   return {
-    version: 3,
+    version: 4,
     server: {
       host: "127.0.0.1",
       port: 8787,
@@ -20,6 +20,7 @@ function baseConfig() {
       maxNativeConnections: 8,
       maxNativeFrameBytes: 1_048_576,
       maxNativeBufferedBytes: 4_194_304,
+      responseRetentionDays: 30,
     },
     models: {
       codex: { agent: "codex", source: "local", workspace: "demo" },
@@ -27,7 +28,7 @@ function baseConfig() {
         agent: "claude",
         source: "managed",
         workspace: "demo",
-        overrides: { permissionMode: "plan" },
+        overrides: { options: { permissionMode: "plan" } },
       },
     },
     workspaces: {
@@ -74,7 +75,7 @@ test("native keys are separate credentials without model or workspace grants", a
 });
 
 test("config validation rejects legacy, dangling grants, and scoped native keys", () => {
-  assert.throws(() => validateConfig({ models: {} }), /version 3/i);
+  assert.throws(() => validateConfig({ models: {} }), /version 4/i);
 
   const config = baseConfig();
   config.keys.bad = {
@@ -97,12 +98,12 @@ test("config validation rejects legacy, dangling grants, and scoped native keys"
   assert.throws(() => validateConfig(nativeConfig), /must not declare grants/i);
 });
 
-test("ConfigStore writes version 3 atomically and never migrates legacy config", async () => {
+test("ConfigStore writes version 4 atomically and never migrates legacy config", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-config-"));
   const filename = path.join(directory, "config.json");
   const store = new ConfigStore(filename);
   await store.save(baseConfig());
-  assert.equal((await store.load()).version, 3);
+  assert.equal((await store.load()).version, 4);
 
   await rm(directory, { recursive: true, force: true });
 });
