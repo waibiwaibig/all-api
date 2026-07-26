@@ -12,6 +12,7 @@ import {
   configureCloudflare,
   detectAgents,
   installAgent,
+  restoreExposure,
   setAutostart,
   startExposure,
   stopExposure,
@@ -248,6 +249,9 @@ async function serve() {
   const address = await app.listen();
   console.log(`All API listening at http://${address.address}:${address.port}`);
   console.log(`Local management: ${endpoint}`);
+  restoreExposure({ dataDirectory, localPort: address.port }).catch((error) => {
+    console.error(`All API could not restore public exposure: ${error.message}`);
+  });
   process.once("SIGINT", () => shutdown().then(() => process.exit(0)));
   process.once("SIGTERM", () => shutdown().then(() => process.exit(0)));
 }

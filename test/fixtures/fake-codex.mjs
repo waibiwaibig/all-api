@@ -37,6 +37,14 @@ lines.on("line", (line) => {
       })}\n`);
       return;
     }
+    if (process.argv.includes("--emit-process-event")) {
+      emit("item/commandExecution/outputDelta", {
+        threadId: message.params.threadId,
+        turnId: "turn-1",
+        itemId: "command-1",
+        delta: "command output",
+      });
+    }
     emit("item/agentMessage/delta", {
       threadId: message.params.threadId,
       turnId: "turn-1",

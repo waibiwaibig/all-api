@@ -60,6 +60,7 @@ all-api autostart on
 `tool_choice`、工具调用和工具结果会完整写入文字上下文；All API 不把它们注册
 为 Agent 原生工具，也不构造客户端 function-calling 循环。交互审批会作为完整
 文字返回并结束该轮；需要真正响应审批的客户端使用 Native。
+无法结构化表达的 Agent 过程事件也会作为带完整 JSON 的文字返回，不会静默丢弃。
 
 Anthropic 必填的 `max_tokens` 会被接收以保持客户端可调用，但 Coding Agent
 没有对应的输出 token 上限；能力目录会明确返回
@@ -158,6 +159,8 @@ all-api agent update claude
 - Codex 使用官方 `codex app-server --stdio`，不解析 TUI。
 - Claude 使用官方 Agent SDK，并显式连接 PATH 中的本机 `claude`。
 - 安装使用官方 npm 包；Claude 更新会优先调用官方 `claude update`。
+- Agent 更新后会重新认证，并按 Chat、Responses、Messages 分别决定是否开放；
+  不沿用更新前的认证缓存。
 - Agent 登录仍由 Agent 自己完成，All API 不保存登录凭据。
 
 外部连接器通过本地 JSON-lines RPC 加入：实现 `initialize`、`session/start`，
@@ -194,6 +197,10 @@ all-api expose relay start --host user@example.com --remote-port 8787
 防火墙和端口转发，修改后需重启服务。Cloudflare 和 Tailscale 继续使用各自
 官方客户端的免费额度、账户规则和访问控制。
 
+Cloudflare/SSH 只有在子进程稳定启动后才记录成功；重复启动会被拒绝。保存的
+暴露配置会在 All API 开机自启或重启时恢复。停止前会核对 PID 对应的命令，
+避免陈旧 PID 误杀其他进程。
+
 ## 会话、隐私与失败语义
 
 - Chat Completions 和 Messages 是无状态转换；Responses 用不透明映射续接
@@ -204,6 +211,8 @@ all-api expose relay start --host user@example.com --remote-port 8787
 - Responses 的 `store:false` 不保存这条 Response，因此之后不能查询或作为
   `previous_response_id` 使用。
 - 明确上传的 Files 保存在本机、按 Key 隔离，直到调用者删除。
+- 标准文件内容只接受当前 Key 上传得到的 `file_id` 或 HTTPS URL；远程请求
+  不能直接读取本机绝对路径。
 - HTTP 客户端断线不会自动取消标准任务。Native WebSocket 断开会立即关闭对应
   Agent 子进程并释放连接；Agent 已保存的线程仍可通过官方 resume 能力续接。
   All API 不保存 Native 事件用于重放。
@@ -223,6 +232,7 @@ npm run test:real-agents
 ```
 
 测试覆盖严格协议、Key/工作区隔离、两种错误方言、Files、Responses 续接、
-Native 原样事件、官方 Agent 接缝、本地管理 socket、断线与显式取消。
+Native 原样事件和启动竞态、官方 Agent 接缝、本地管理 socket、断线与显式取消。
 `test:real-agents` 会使用官方 OpenAI/Anthropic SDK 调用当前登录的真实
-Codex/Claude，因此只在执行版本认证时运行。
+Codex/Claude，并通过 WebSocket 验证两者的真实 Native 协议，因此只在执行
+版本认证时运行。

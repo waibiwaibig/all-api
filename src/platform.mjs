@@ -116,17 +116,30 @@ export async function startExposure(provider, options) {
     const executable = await ensureCloudflared();
     const configPath = options.configPath ?? path.join(options.dataDirectory, "cloudflare.yml");
     await access(configPath, fsConstants.R_OK);
-    return startDetached(executable, ["tunnel", "--config", configPath, "run", options.name ?? "all-api"], {
+    return startManagedProcess(executable, [
+      "tunnel", "--config", configPath, "run", options.name ?? "all-api",
+    ], {
       statePath: exposureStatePath(options.dataDirectory),
       provider,
+      restore: {
+        name: options.name ?? "all-api",
+        configPath,
+      },
     });
   }
   if (provider === "tailscale") {
+    await ensureExposureSlot(exposureStatePath(options.dataDirectory));
     const executable = await commandPath("tailscale");
     if (!executable) throw new Error("Tailscale is not installed");
-    return runChecked(executable, [
+    const result = await runChecked(executable, [
       "funnel", "--bg", "--yes", `http://127.0.0.1:${options.localPort}`,
     ], { inherit: true });
+    await saveExposureState(options.dataDirectory, {
+      provider,
+      restore: {},
+      startedAt: new Date().toISOString(),
+    });
+    return result;
   }
   if (provider === "relay") {
     const executable = await commandPath("ssh");
@@ -134,34 +147,65 @@ export async function startExposure(provider, options) {
     if (!options.host || !Number.isInteger(options.remotePort)) {
       throw new Error("Relay exposure requires host and remotePort");
     }
-    return startDetached(executable, [
+    return startManagedProcess(executable, [
       "-N", "-o", "ExitOnForwardFailure=yes",
       "-R", `127.0.0.1:${options.remotePort}:127.0.0.1:${options.localPort}`,
       options.host,
     ], {
       statePath: exposureStatePath(options.dataDirectory),
       provider,
+      restore: {
+        host: options.host,
+        remotePort: options.remotePort,
+      },
     });
   }
   throw new Error(`Unknown exposure provider: ${provider}`);
 }
 
 export async function stopExposure(provider, options) {
-  if (provider === "tailscale") {
-    const executable = await commandPath("tailscale");
-    if (!executable) throw new Error("Tailscale is not installed");
-    return runChecked(executable, ["funnel", "--https=443", "off"], { inherit: true });
-  }
   const statePath = exposureStatePath(options.dataDirectory);
   const state = JSON.parse(await readFile(statePath, "utf8"));
   if (state.provider !== provider) throw new Error(`Active exposure is ${state.provider}, not ${provider}`);
-  try {
-    process.kill(state.pid, "SIGTERM");
-  } catch (error) {
-    if (error.code !== "ESRCH") throw error;
+  if (provider === "tailscale") {
+    const executable = await commandPath("tailscale");
+    if (!executable) throw new Error("Tailscale is not installed");
+    const result = await runChecked(executable, ["funnel", "--https=443", "off"], { inherit: true });
+    await rm(statePath, { force: true });
+    return result;
+  }
+  const stopped = await processMatchesState(state);
+  if (stopped) {
+    try {
+      process.kill(state.pid, "SIGTERM");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
   }
   await rm(statePath, { force: true });
-  return { stopped: provider };
+  return { stopped: provider, processFound: stopped };
+}
+
+export async function restoreExposure({ dataDirectory, localPort }) {
+  let state;
+  try {
+    state = JSON.parse(await readFile(exposureStatePath(dataDirectory), "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return { restored: false };
+    throw error;
+  }
+  if (state.pid && await processMatchesState(state)) {
+    return { restored: false, alreadyRunning: true, provider: state.provider };
+  }
+  await rm(exposureStatePath(dataDirectory), { force: true });
+  return {
+    restored: true,
+    ...(await startExposure(state.provider, {
+      ...state.restore,
+      dataDirectory,
+      localPort,
+    })),
+  };
 }
 
 export async function setAutostart({ enabled, dataDirectory, cliPath }) {
@@ -220,19 +264,93 @@ async function cloudflareTunnels(executable) {
   }
 }
 
-async function startDetached(command, args, { statePath, provider }) {
+export async function startManagedProcess(command, args, {
+  statePath,
+  provider,
+  restore = {},
+  startupTimeoutMs = 750,
+}) {
+  await ensureExposureSlot(statePath);
   const child = spawn(command, args, {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
   });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.off("error", fail);
+      child.off("exit", exited);
+      resolve();
+    }, startupTimeoutMs);
+    const fail = (error) => {
+      clearTimeout(timer);
+      reject(error);
+    };
+    const exited = (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`${path.basename(command)} exited during startup (${signal ?? code})`));
+    };
+    child.once("error", fail);
+    child.once("exit", exited);
+  });
+  if (!child.pid || !isProcessRunning(child.pid)) {
+    throw new Error(`${path.basename(command)} did not remain running`);
+  }
   child.unref();
-  await writeFile(statePath, JSON.stringify({
-    provider,
-    pid: child.pid,
-    startedAt: new Date().toISOString(),
-  }), { mode: 0o600 });
+  try {
+    await mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    await writeFile(statePath, JSON.stringify({
+      provider,
+      pid: child.pid,
+      command,
+      restore,
+      startedAt: new Date().toISOString(),
+    }), { mode: 0o600 });
+  } catch (error) {
+    child.kill("SIGTERM");
+    throw error;
+  }
   return { provider, pid: child.pid };
+}
+
+async function saveExposureState(dataDirectory, state) {
+  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(exposureStatePath(dataDirectory), JSON.stringify(state), { mode: 0o600 });
+}
+
+async function ensureExposureSlot(statePath) {
+  try {
+    const existing = JSON.parse(await readFile(statePath, "utf8"));
+    if (existing.provider === "tailscale" || await processMatchesState(existing)) {
+      throw new Error(`Exposure ${existing.provider} is already running`);
+    }
+    await rm(statePath, { force: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+async function processMatchesState(state) {
+  if (!Number.isInteger(state?.pid) || !state.command || !isProcessRunning(state.pid)) return false;
+  if (process.platform === "win32") {
+    const result = await runCommand("tasklist.exe", [
+      "/FI", `PID eq ${state.pid}`, "/FO", "CSV", "/NH",
+    ]);
+    return result.ok && result.stdout.toLowerCase().includes(
+      path.basename(state.command).toLowerCase(),
+    );
+  }
+  const result = await runCommand("ps", ["-p", String(state.pid), "-o", "comm="]);
+  return result.ok && path.basename(result.stdout.trim()) === path.basename(state.command);
+}
+
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function macAutostart(enabled, dataDirectory, cliPath) {

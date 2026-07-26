@@ -129,6 +129,25 @@ test("Codex adapter surfaces an approval request as information and interrupts t
   assert.equal(events.at(-1).type, "interrupted");
 });
 
+test("Codex adapter preserves process notifications for standard text conversion", async () => {
+  const adapter = new CodexAdapter({
+    executable: process.execPath,
+    appServerArgs: [fakeCodex, "--emit-process-event"],
+  });
+  const events = [];
+  for await (const event of adapter.run({
+    model: "codex",
+    profile,
+    workspace,
+    input: "hello",
+    tools: [],
+    signal: new AbortController().signal,
+  })) events.push(event);
+  const processEvent = events.find((event) => event.type === "agent.event");
+  assert.equal(processEvent.payload.method, "item/commandExecution/outputDelta");
+  assert.equal(processEvent.payload.params.delta, "command output");
+});
+
 test("Claude adapter consumes official SDK messages and resumes the SDK session", async () => {
   const calls = [];
   const adapter = new ClaudeAdapter({
@@ -201,6 +220,15 @@ test("managed Claude profiles pass official SDK options without a whitelist", as
   assert.deepEqual(calls[0].options.futureOfficialOption, { enabled: true });
 });
 
+test("Claude certification is invalidated when the executable version changes", async () => {
+  let version = "2.1.119";
+  const adapter = new ClaudeAdapter();
+  adapter.describe = async () => ({ version });
+  assert.equal((await adapter.verifyStandard()).status, "verified");
+  version = "2.1.120";
+  assert.equal((await adapter.verifyStandard()).status, "unverified");
+});
+
 test("Claude adapter rejects official SDK error results", async () => {
   const adapter = new ClaudeAdapter({
     query() {
@@ -264,6 +292,38 @@ test("Claude adapter surfaces permission callbacks as information", async () => 
   assert.deepEqual(events[0].payload.input, { command: "touch approval.txt" });
   assert.equal(events.at(-1).type, "interrupted");
   assert.deepEqual(events.at(-1).usage, { input_tokens: 4, output_tokens: 1 });
+});
+
+test("Claude adapter preserves non-answer process messages", async () => {
+  const adapter = new ClaudeAdapter({
+    query() {
+      return (async function* () {
+        yield {
+          type: "system",
+          subtype: "init",
+          session_id: "claude-session-1",
+          cwd: workspace.path,
+        };
+        yield {
+          type: "result",
+          subtype: "success",
+          session_id: "claude-session-1",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        };
+      })();
+    },
+  });
+  const events = [];
+  for await (const event of adapter.run({
+    model: "claude",
+    profile,
+    workspace,
+    input: "hello",
+    tools: [],
+    signal: new AbortController().signal,
+  })) events.push(event);
+  assert.equal(events[0].type, "agent.event");
+  assert.equal(events[0].payload.subtype, "init");
 });
 
 test("Claude native transport forwards official stream-json frames without interpreting controls", async () => {

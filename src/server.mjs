@@ -42,6 +42,7 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
   });
   const webSockets = new WebSocketServer({
     noServer: true,
+    maxPayload: config.server.maxNativeFrameBytes,
     handleProtocols(protocols) {
       return protocols.has("allapi.native") ? "allapi.native" : false;
     },
@@ -82,7 +83,7 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
       server.close();
       for (const socket of sockets) socket.destroy();
       await registry.close();
-      await Promise.all([responses.flush(), files.flush()]);
+      await Promise.all([responses.close(), files.flush()]);
     },
   };
 }
@@ -146,6 +147,7 @@ async function chatCompletions(context, grant) {
   const converted = chatInput(body.messages);
   const tools = validateOpenAiTools(body.tools);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
+    protocol: "chat_completions",
     ...converted,
     tools,
     toolContext: {
@@ -158,6 +160,7 @@ async function chatCompletions(context, grant) {
   if (body.stream) {
     startSse(response);
     let roleSent = false;
+    let terminal = false;
     for await (const event of run.events) {
       if (event.type === "text.delta") {
         sendSse(response, {
@@ -174,6 +177,10 @@ async function chatCompletions(context, grant) {
         });
         roleSent = true;
       } else if (event.type === "completed" || event.type === "interrupted") {
+        if (body.stream_options?.include_usage) {
+          requireUsage(event.usage, "Chat Completions stream_options.include_usage");
+        }
+        terminal = true;
         sendSse(response, {
           id: run.id,
           object: "chat.completion.chunk",
@@ -194,6 +201,7 @@ async function chatCompletions(context, grant) {
         }
       }
     }
+    if (!terminal) throw agentMissingTerminalError();
     writeIfOpen(response, "data: [DONE]\n\n");
     return response.end();
   }
@@ -240,6 +248,7 @@ async function createResponse(context, grant) {
   }
   const tools = validateResponseTools(body.tools);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
+    protocol: "responses",
     input: responseInput(body.input),
     instructions: body.instructions,
     tools,
@@ -257,6 +266,7 @@ async function createResponse(context, grant) {
     model: body.model,
     workspace: run.workspace,
     metadata: body.metadata ?? {},
+    parallelToolCalls: body.parallel_tool_calls ?? true,
     persist: body.store !== false,
     controller: run.controller,
   });
@@ -276,6 +286,7 @@ async function createResponse(context, grant) {
       }, "response.in_progress");
       let text = "";
       let textStarted = false;
+      let terminal = false;
       for await (const event of run.events) {
         if (event.type === "text.delta") {
           if (!textStarted) {
@@ -305,6 +316,7 @@ async function createResponse(context, grant) {
             sequence_number: sequence++,
           }, "response.output_text.delta");
         } else if (event.type === "completed" || event.type === "interrupted") {
+          terminal = true;
           if (textStarted) {
             sendSse(response, {
               type: "response.output_text.done",
@@ -351,6 +363,7 @@ async function createResponse(context, grant) {
           if (!record.persist) responses.delete(record.id);
         }
       }
+      if (!terminal) throw agentMissingTerminalError();
       return response.end();
     } catch (error) {
       responses.fail(record.id, error);
@@ -412,6 +425,7 @@ async function messages(context, grant) {
   const converted = anthropicInput(body.messages, body.system);
   const tools = validateAnthropicTools(body.tools);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
+    protocol: "messages",
     ...converted,
     tools,
     toolContext: {
@@ -486,10 +500,16 @@ async function prepareRun(context, grant, modelId, selectedWorkspace, options) {
     status: "unverified",
     reason: "Agent adapter has no standard protocol certification",
   };
-  if (compatibility.status !== "verified") {
+  const protocolCompatibility = compatibility.protocols?.[options.protocol] ?? {
+    status: "unverified",
+    reason: `Agent adapter has no ${options.protocol} certification`,
+  };
+  if (protocolCompatibility.status !== "verified") {
     throw new HttpError(
       409,
-      compatibility.reason ?? "Selected Agent protocol is not verified for standard APIs",
+      protocolCompatibility.reason
+        ?? compatibility.reason
+        ?? `Selected Agent is not verified for ${options.protocol}`,
       "agent_protocol_unverified",
     );
   }
@@ -614,12 +634,17 @@ async function handleUpgrade({
   webSockets.handleUpgrade(request, socket, head, async (webSocket) => {
     let native;
     let closed = false;
+    let incoming = Promise.resolve();
+    const pendingFrames = [];
+    let pendingBytes = 0;
     const closeNative = async (code, reason) => {
       if (closed) return;
       closed = true;
       const current = native;
       native = undefined;
       nativeSessions.delete(closeNative);
+      pendingFrames.length = 0;
+      pendingBytes = 0;
       const keyed = nativeSessionsByKey.get(grant.keyId);
       keyed?.delete(closeNative);
       if (keyed?.size === 0) nativeSessionsByKey.delete(grant.keyId);
@@ -628,6 +653,37 @@ async function handleUpgrade({
     };
     webSocket.once("close", () => {
       closeNative().catch(() => {});
+    });
+    webSocket.once("error", (error) => {
+      closeNative(1009, String(error?.message ?? error).slice(0, 120)).catch(() => {});
+    });
+    const drainFrames = () => {
+      if (!native || closed) return;
+      const current = native;
+      while (pendingFrames.length) {
+        const [data, isBinary] = pendingFrames.shift();
+        incoming = incoming
+          .then(() => current.receive(data, isBinary))
+          .finally(() => {
+            pendingBytes = Math.max(0, pendingBytes - data.byteLength);
+          })
+          .catch((error) => {
+            closeNative(1011, String(error?.message ?? error).slice(0, 120)).catch(() => {});
+          });
+      }
+    };
+    webSocket.on("message", (data, isBinary) => {
+      if (data.byteLength > config.server.maxNativeFrameBytes) {
+        closeNative(1009, "Native frame limit exceeded").catch(() => {});
+        return;
+      }
+      if (pendingBytes + data.byteLength > config.server.maxNativeBufferedBytes) {
+        closeNative(1009, "Native input buffer limit exceeded").catch(() => {});
+        return;
+      }
+      pendingBytes += data.byteLength;
+      pendingFrames.push([Buffer.from(data), isBinary]);
+      drainFrames();
     });
     try {
       nativeSessions.add(closeNative);
@@ -658,16 +714,13 @@ async function handleUpgrade({
           ).catch(() => {});
         },
       });
-      let incoming = Promise.resolve();
-      webSocket.on("message", (data, isBinary) => {
-        if (data.byteLength > config.server.maxNativeFrameBytes) {
-          closeNative(1009, "Native frame limit exceeded").catch(() => {});
-          return;
-        }
-        incoming = incoming.then(() => native.receive(data, isBinary)).catch((error) => {
-          closeNative(1011, String(error?.message ?? error).slice(0, 120)).catch(() => {});
-        });
-      });
+      if (closed) {
+        const current = native;
+        native = undefined;
+        await current.close();
+        return;
+      }
+      drainFrames();
     } catch (error) {
       await closeNative();
       webSocket.close(1011, error.message.slice(0, 120));
@@ -680,11 +733,17 @@ export class ResponseStore {
   #saving = Promise.resolve();
   #retentionMs;
   #now;
+  #expiryTimer;
 
   constructor(filename, { retentionDays = 30, now = Date.now } = {}) {
     this.filename = filename;
     this.#retentionMs = retentionDays * 86_400_000;
     this.#now = now;
+    this.#expiryTimer = setInterval(
+      () => this.#pruneExpired(),
+      Math.max(10, Math.min(this.#retentionMs, 3_600_000)),
+    );
+    this.#expiryTimer.unref();
   }
 
   async load() {
@@ -774,7 +833,7 @@ export class ResponseStore {
       this.#records.delete(id);
       this.#save().catch(() => {});
     }
-    if (!record || this.#expired(record) || record.keyId !== keyId) {
+    if (!record || record.persist === false || this.#expired(record) || record.keyId !== keyId) {
       throw new HttpError(404, `Response "${id}" not found`, "not_found");
     }
     return record;
@@ -791,6 +850,11 @@ export class ResponseStore {
 
   flush() {
     return this.#saving;
+  }
+
+  async close() {
+    clearInterval(this.#expiryTimer);
+    await this.#saving;
   }
 
   async #save() {
@@ -810,6 +874,17 @@ export class ResponseStore {
   #expired(record) {
     return Number.isFinite(record.expiresAt)
       && record.expiresAt <= Math.floor(this.#now() / 1000);
+  }
+
+  #pruneExpired() {
+    let changed = false;
+    for (const [id, record] of this.#records) {
+      if (!this.#expired(record)) continue;
+      record.controller?.abort(new Error("Response retention expired"));
+      this.#records.delete(id);
+      changed = true;
+    }
+    if (changed) this.#save().catch(() => {});
   }
 }
 
@@ -951,7 +1026,6 @@ async function catalog({ config, registry }, grant) {
         reason: "Agent adapter has no standard protocol certification",
       },
     ]);
-    const standardSupported = compatibility.status === "verified";
     return {
       id,
       agent: profile.agent,
@@ -962,7 +1036,7 @@ async function catalog({ config, registry }, grant) {
       standard_compatibility: compatibility,
       protocols: {
         chat_completions: {
-          supported: standardSupported,
+          supported: compatibility.protocols?.chat_completions?.status === "verified",
           parameters: CHAT_FIELDS,
           client_tools: false,
           tools_as_text: true,
@@ -972,7 +1046,7 @@ async function catalog({ config, registry }, grant) {
           interactive_approvals: false,
         },
         responses: {
-          supported: standardSupported,
+          supported: compatibility.protocols?.responses?.status === "verified",
           parameters: RESPONSE_FIELDS,
           client_tools: false,
           tools_as_text: true,
@@ -981,7 +1055,7 @@ async function catalog({ config, registry }, grant) {
           interactive_approvals: false,
         },
         messages: {
-          supported: standardSupported,
+          supported: compatibility.protocols?.messages?.status === "verified",
           parameters: MESSAGE_FIELDS,
           client_tools: false,
           tools_as_text: true,
@@ -999,6 +1073,9 @@ async function catalog({ config, registry }, grant) {
           protocol_version: adapter.native?.protocolVersion ?? null,
           resumable: Boolean(adapter.native?.resumable),
           client_tools: Boolean(adapter.native?.clientTools),
+          startup_configuration: "model_profile",
+          frame_configuration: "agent_protocol_only",
+          workspace_from_frames: Boolean(adapter.native?.workspaceFromFrames),
         },
       },
       unsupported_behavior: "error",
@@ -1035,7 +1112,7 @@ function responseEnvelope(record, status, text, usage) {
     model: record.model,
     metadata: record.metadata ?? {},
     output,
-    parallel_tool_calls: true,
+    parallel_tool_calls: record.parallelToolCalls ?? true,
     error: status === "failed" ? record.error : null,
     incomplete_details: status === "incomplete" ? record.incompleteDetails : null,
     ...(finalUsage && { usage: responseUsage(finalUsage) }),
@@ -1269,7 +1346,7 @@ async function resolveInputBlock(block, files, owner) {
       ? { type: "local_image", path: file.path, mediaType: file.mediaType }
       : { ...block, path: file.path, mediaType: file.mediaType };
   }
-  if (block.type === "file" && !path.isAbsolute(block.path ?? "") && !/^https:\/\//.test(block.path ?? "")) {
+  if (block.type === "file" && !/^https:\/\//.test(block.path ?? "")) {
     throw new HttpError(400, "File inputs must use an uploaded file_id or HTTPS URL");
   }
   return block;
@@ -1318,7 +1395,14 @@ async function collect(events) {
       status = event.type;
     }
   }
+  if (!status) throw agentMissingTerminalError();
   return { text, usage, sessionId, status };
+}
+
+function agentMissingTerminalError() {
+  const error = new Error("Agent stream ended without an official terminal event");
+  error.code = "agent_protocol_error";
+  return error;
 }
 
 async function* releaseWhenDone(events, release) {

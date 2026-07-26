@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 import { query as claudeQuery } from "@anthropic-ai/claude-agent-sdk";
 
 const CERTIFIED_CODEX_VERSION = "0.144.1";
-const CERTIFIED_CLAUDE_VERSION = "2.1.119";
+const CERTIFIED_CLAUDE_VERSIONS = new Set(["2.1.119"]);
 const CERTIFIED_CLAUDE_SDK_VERSION = "0.3.220";
 
 export class AgentRegistry {
@@ -201,6 +201,7 @@ export class CodexAdapter {
     protocolVersion: null,
     resumable: true,
     clientTools: true,
+    workspaceFromFrames: true,
   });
 
   constructor({ executable = "codex", appServerArgs = ["app-server", "--stdio"] } = {}) {
@@ -209,11 +210,19 @@ export class CodexAdapter {
   }
 
   describe() {
-    return this.description ??= executableDescription(this.executable);
+    return executableDescription(this.executable);
   }
 
-  verifyStandard() {
-    return this.standardCompatibility ??= verifyCodexStandard(this.executable, this.describe());
+  async verifyStandard() {
+    const description = await this.describe();
+    if (this.standardVersion !== description.version) {
+      this.standardVersion = description.version;
+      this.standardCompatibility = verifyCodexStandard(
+        this.executable,
+        Promise.resolve(description),
+      );
+    }
+    return this.standardCompatibility;
   }
 
   async *run(request) {
@@ -267,7 +276,7 @@ export class CodexAdapter {
         } else if (message.method === "thread/tokenUsage/updated"
           && message.params.turnId === turnId) {
           usage = codexUsage(message.params.tokenUsage.last);
-        } else if (message.id !== undefined && isInteractiveCodexRequest(message.method)) {
+        } else if (message.id !== undefined && typeof message.method === "string") {
           yield { type: "interaction", payload: message };
           yield { type: "interrupted", sessionId: threadId, ...(usage && { usage }) };
           return;
@@ -281,6 +290,8 @@ export class CodexAdapter {
           );
           error.code = `turn_${message.params.turn.status}`;
           throw error;
+        } else {
+          yield { type: "agent.event", payload: message };
         }
       }
     } finally {
@@ -318,6 +329,7 @@ export class ClaudeAdapter {
     protocolVersion: null,
     resumable: false,
     clientTools: true,
+    workspaceFromFrames: false,
   });
 
   constructor({ executable = "claude", query = claudeQuery, nativeArgs } = {}) {
@@ -327,11 +339,16 @@ export class ClaudeAdapter {
   }
 
   describe() {
-    return this.description ??= executableDescription(this.executable);
+    return executableDescription(this.executable);
   }
 
-  verifyStandard() {
-    return this.standardCompatibility ??= verifyClaudeStandard(this.describe());
+  async verifyStandard() {
+    const description = await this.describe();
+    if (this.standardVersion !== description.version) {
+      this.standardVersion = description.version;
+      this.standardCompatibility = verifyClaudeStandard(Promise.resolve(description));
+    }
+    return this.standardCompatibility;
   }
 
   async *run(request) {
@@ -385,7 +402,8 @@ export class ClaudeAdapter {
       if (message.type === "assistant") {
         for (const block of message.message?.content ?? []) {
           if (block.type === "text") yield { type: "text.delta", delta: block.text };
-          if (block.type === "tool_use") yield { type: "agent.tool", payload: block };
+          else if (block.type === "tool_use") yield { type: "agent.tool", payload: block };
+          else yield { type: "agent.event", payload: { message, block } };
         }
       } else if (message.type === "result") {
         if (message.is_error || message.subtype !== "success") {
@@ -406,6 +424,8 @@ export class ClaudeAdapter {
           }),
         };
         return;
+      } else {
+        yield { type: "agent.event", payload: message };
       }
     }
     throw new Error("Claude Agent SDK ended without a result message");
@@ -440,6 +460,7 @@ export class ConnectorAdapter {
       protocolVersion: "1",
       resumable: Boolean(definition.capabilities.continuation),
       clientTools: definition.capabilities.tools.includes("client"),
+      workspaceFromFrames: false,
     };
   }
 
@@ -448,10 +469,10 @@ export class ConnectorAdapter {
   }
 
   async verifyStandard() {
-    return {
+    return standardCompatibility({
       status: "unverified",
       reason: "Custom connectors are Native-only until independently certified",
-    };
+    });
   }
 
   async *run(request) {
@@ -632,15 +653,6 @@ function rpcError(error) {
   return result;
 }
 
-function isInteractiveCodexRequest(method) {
-  return typeof method === "string" && (
-    method.includes("requestApproval")
-    || method === "permissions/requestApproval"
-    || method === "item/tool/requestUserInput"
-    || method === "item/tool/call"
-  );
-}
-
 function imageSource(url) {
   if (!url.startsWith("data:")) return { type: "url", url };
   const match = /^data:([^;,]+);base64,(.+)$/s.exec(url);
@@ -708,11 +720,11 @@ async function verifyCodexStandard(executable, descriptionPromise) {
   const description = await descriptionPromise;
   const version = semanticVersion(description.version);
   if (version !== CERTIFIED_CODEX_VERSION) {
-    return {
+    return standardCompatibility({
       status: "unverified",
       agent_version: version,
       reason: `Codex ${version ?? "unknown"} is not certified; expected ${CERTIFIED_CODEX_VERSION}`,
-    };
+    });
   }
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-codex-schema-"));
   try {
@@ -720,11 +732,11 @@ async function verifyCodexStandard(executable, descriptionPromise) {
       "app-server", "generate-json-schema", "--out", directory,
     ], 30_000);
     if (!generated.ok) {
-      return {
+      return standardCompatibility({
         status: "unverified",
         agent_version: version,
         reason: "Codex app-server schema generation failed",
-      };
+      });
     }
     const [notifications, completed] = await Promise.all([
       readFile(path.join(directory, "ServerNotification.json"), "utf8"),
@@ -734,23 +746,23 @@ async function verifyCodexStandard(executable, descriptionPromise) {
       || !notifications.includes('"thread/tokenUsage/updated"')
       || !completed.includes('"failed"')
       || !completed.includes('"interrupted"')) {
-      return {
+      return standardCompatibility({
         status: "unverified",
         agent_version: version,
         reason: "Codex app-server schema does not match the certified protocol",
-      };
+      });
     }
-    return {
+    return standardCompatibility({
       status: "verified",
       agent_version: version,
       evidence: "official_schema_and_real_sdk_e2e",
-    };
+    });
   } catch (error) {
-    return {
+    return standardCompatibility({
       status: "unverified",
       agent_version: version,
       reason: `Codex protocol check failed: ${error.message}`,
-    };
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -769,19 +781,35 @@ async function verifyClaudeStandard(descriptionPromise) {
   } catch {
     sdkVersion = null;
   }
-  if (version !== CERTIFIED_CLAUDE_VERSION || sdkVersion !== CERTIFIED_CLAUDE_SDK_VERSION) {
-    return {
+  if (!CERTIFIED_CLAUDE_VERSIONS.has(version) || sdkVersion !== CERTIFIED_CLAUDE_SDK_VERSION) {
+    return standardCompatibility({
       status: "unverified",
       agent_version: version,
       sdk_version: sdkVersion,
       reason: `Claude ${version ?? "unknown"} / SDK ${sdkVersion ?? "unknown"} is not certified`,
-    };
+    });
   }
-  return {
+  return standardCompatibility({
     status: "verified",
     agent_version: version,
     sdk_version: sdkVersion,
     evidence: "official_sdk_and_real_sdk_e2e",
+  });
+}
+
+function standardCompatibility(result) {
+  return {
+    ...result,
+    protocols: Object.fromEntries(
+      ["chat_completions", "responses", "messages"].map((protocol) => [
+        protocol,
+        {
+          status: result.status,
+          ...(result.reason && { reason: result.reason }),
+          ...(result.evidence && { evidence: result.evidence }),
+        },
+      ]),
+    ),
   };
 }
 

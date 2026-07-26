@@ -29,7 +29,16 @@ test("official SDKs consume All API standard responses", async () => {
   const registry = new AgentRegistry().register("fixture", {
     capabilities,
     async verifyStandard() {
-      return { status: "verified", evidence: "deterministic-fixture" };
+      return {
+        status: "verified",
+        evidence: "deterministic-fixture",
+        protocols: Object.fromEntries(
+          ["chat_completions", "responses", "messages"].map((protocol) => [
+            protocol,
+            { status: "verified", evidence: "deterministic-fixture" },
+          ]),
+        ),
+      };
     },
     async *run({ sessionId }) {
       yield { type: "text.delta", delta: "official SDK" };

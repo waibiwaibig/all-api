@@ -66,6 +66,8 @@ flowchart LR
 - 未知的 All API 外层参数块直接拒绝，不能静默忽略。
 
 Native 帧中的设置优先于模型配置能够提供的启动默认值；All API 不修改帧。
+无法由 Agent 原生帧表达的启动参数仍来自模型配置。能力目录明确声明每种
+Native 协议能否从帧中选择工作目录。
 
 ## 5. Native 传输与生命周期
 
@@ -86,6 +88,7 @@ sequenceDiagram
 ```
 
 - Native 只限制连接数、帧大小和待发送字节，不解析回合。
+- Agent 启动期间到达的帧按序缓冲且受同一字节上限约束。
 - 客户端断开、Key 撤销、帧超限和缓冲超限都会关闭 Agent 子进程。
 - All API 不保存 Native 输出，不实现重放或自己的重连协议。
 - Agent 已保存的 thread/session 仍可通过其原生 resume 能力续接。
@@ -134,6 +137,8 @@ Agent 线程仍是对话事实来源。All API 只为实现 Responses 官方状�
 作为 `previous_response_id`。只有 completed 且有 Agent session 的 Response
 可以续接。
 
+过期记录由运行中的服务主动删除，不依赖重启或客户端再次查询。
+
 服务重启时仍为 in_progress 的记录改为 `incomplete/server_restarted`，不自动
 重跑。
 
@@ -154,6 +159,8 @@ Agent 线程仍是对话事实来源。All API 只为实现 Responses 官方状�
 - Agent 真正支持某种输入才在能力目录声明。
 - 不支持时在启动 Agent 前失败，不把文件降级成 `[File: path]` 文字。
 - All API 不下载远程 URL、不做 OCR/转录或自制 DNS/SSRF 判断。
+- 标准文件输入只接受由当前 Key 上传的 `file_id` 或 HTTPS URL；客户端不能把
+  本机绝对路径伪装成文件输入。
 - URL 和网络访问权限交给 Agent sandbox、permission mode 和运行环境。
 
 ## 12. 能力认证与更新
@@ -171,6 +178,7 @@ Agent × Agent/SDK 版本 × 标准接口 × 输入、流式、续接、usage �
 - Mock fixture 只用于快速回归，不能单独证明兼容。
 - 当前认证目标：Codex 0.144.1、Claude Code 2.1.119、
   Claude Agent SDK 0.3.220。
+- 认证状态逐标准接口记录；一个接口通过不能自动开放另外两个接口。
 
 ## 13. 新 Agent
 
