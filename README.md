@@ -7,11 +7,13 @@ All API 是运行在 Agent 同一台机器上的桥接器。它把本机 Codex�
 ```mermaid
 flowchart LR
     C["OpenAI / Anthropic 客户端"] --> HTTP["严格标准协议转换"]
-    N["高级客户端"] --> WS["Native WebSocket 原样事件"]
-    HTTP --> R["Key + 模型配置 + 工作区"]
-    WS --> R
+    N["高级客户端"] --> WS["Native WebSocket 原样帧"]
+    HTTP --> AK["Access Key"]
+    WS --> NK["Native Key"]
+    AK --> R["模型配置 + 已授权工作区"]
+    NK --> R
     R --> CX["Codex app-server"]
-    R --> CL["Claude Agent SDK → 本机 claude"]
+    R --> CL["Claude Agent SDK / 官方 stream-json"]
     R --> P["外部 Agent 连接器"]
 ```
 
@@ -30,7 +32,7 @@ all-api up
 
 `init` 会检测本机 Agent，登记工作目录，并输出只显示一次的 Access Key。
 服务默认只监听 `127.0.0.1:8787`。配置和 Key 哈希保存在 `~/.all-api`；
-可用 `ALL_API_HOME` 改变该目录。
+可用 `ALL_API_HOME` 改变该目录。0.3 使用配置版本 3，刻意不迁移旧配置。
 
 ```sh
 all-api status
@@ -48,26 +50,35 @@ all-api autostart on
 | OpenAI 旧生态 | `POST /v1/chat/completions` | Chat Completions |
 | OpenAI 新生态 | `POST /v1/responses` | Responses |
 | Anthropic 生态 | `POST /v1/messages` | Messages |
-| 完整 Agent 能力 | `WS /v1/native/sessions` | 薄信封内的 Agent 官方消息 |
+| 完整 Agent 能力 | `WS /v1/native/sessions?model=…` | Agent 官方机器消息原样帧 |
 | 模型发现 | `GET /v1/models` | 按请求头返回 OpenAI 或 Anthropic 形状 |
 | 文件 | `/v1/files` | 按请求头返回 OpenAI 或 Anthropic 形状 |
 | 能力与工作区 | `GET /allapi/v1/catalog` | All API 能力目录 |
 
-标准协议是严格兼容层：未知参数、无法表达的输入、客户端工具或交互审批会明确
-失败，不会被静默忽略。Native 只使用：
+标准协议是严格兼容层：未知参数和无法准确实现的能力会明确失败，不会被静默
+忽略。调用方函数工具只会在目标 Agent 适配器确实支持完整工具回合时开放；
+交互审批只在 Native 中开放。强制 `tool_choice`、禁止并行工具等无法保证的
+约束会失败。Anthropic 必填的 `max_tokens` 会被接收以保持客户端可调用，但
+Coding Agent 没有对应的输出 token 上限；能力目录会明确返回
+`max_tokens_enforced: false`。
+
+Native 没有 All API 消息格式。WebSocket 建立后，客户端发给 All API 的每一个
+帧就是发给 Agent 官方机器接口的帧；Agent 返回的帧也不加信封。例如 Codex
+客户端直接发送：
 
 ```json
-{"type":"agent.input","payload":{"method":"turn/steer","params":{}}}
+{"id":"1","method":"initialize","params":{"clientInfo":{"name":"my-client","version":"1.0"}}}
 ```
 
-返回：
+Codex Native 对应 `app-server` JSON-RPC；Claude Native 对应 Claude Code
+官方双向 `stream-json`（也是 Agent SDK 使用的机器协议）。
+`model` 只选择要启动的 Agent 配置；官方消息里能设置的模型、权限、目录或
+会话信息仍以该消息为准。Native 传输错误在升级前使用 HTTP 状态，升级后使用
+WebSocket close code，不会伪造一条 Agent 错误消息。
 
-```json
-{"type":"agent.event","payload":{"method":"turn/started","params":{}}}
-```
-
-其中 `payload` 不加工。Codex Native 对应 app-server JSON-RPC；Claude Native
-对应 Agent SDK 消息。
+非浏览器客户端用 `Authorization: Bearer <Native Key>`。浏览器无法设置该
+请求头时，用 `["allapi.native", "<Native Key>"]` 作为 WebSocket
+subprotocol；Key 绝不放在 URL 查询参数中。
 
 OpenAI 示例：
 
@@ -90,8 +101,9 @@ curl http://127.0.0.1:8787/v1/messages \
   -d '{"model":"claude","max_tokens":1024,"messages":[{"role":"user","content":"检查项目"}]}'
 ```
 
-Key 只有一个工作区时可省略 `X-AllAPI-Workspace`。Key 授权多个工作区时必须
-明确选择。调用方永远不能直接传任意本地路径。
+每个 Access Key 都有一个默认工作区，因此通常可省略
+`X-AllAPI-Workspace`；需要时可在该 Key 已授权的工作区内覆盖。调用方永远
+不能直接传任意本地路径。
 
 ## 模型配置、工作区和 Key
 
@@ -99,20 +111,35 @@ Key 只有一个工作区时可省略 `X-AllAPI-Workspace`。Key 授权多个工
 继承本机 Agent 的实时配置；`source=managed` 只保存要覆盖的原生参数。
 
 ```sh
+all-api workspace add work /absolute/path/to/project
+
 all-api model put codex:review \
   --agent codex \
+  --workspace work \
   --source managed \
   --overrides '{"model":"gpt-5.4","approvalPolicy":"never","sandbox":"read-only"}'
 
-all-api workspace add work /absolute/path/to/project
-all-api key create phone --models codex:review --workspaces work
+all-api key create phone \
+  --type access \
+  --models codex:review \
+  --workspaces work \
+  --default-workspace work
+
+# Native Key 不包含模型、配置或工作区授权；它只用于完整原生连接
+all-api key create native-phone --type native
 all-api models
 all-api workspaces
 all-api keys
 ```
 
-修改模型配置和创建 Key 是两套接口。Key 只选择可用模型和工作区，不携带模型
-内部参数。删除仍被 Key 使用的模型或工作区会失败。
+修改模型配置和创建 Key 是两套接口。Access Key 只选择可用模型、工作区和
+其中一个默认工作区，不携带模型内部参数。Native Key 是独立的高权限凭据，
+能连接本机所有 Native Agent；撤销后，正在使用它的 WebSocket 会立即关闭。
+两类 Key 都不能调用本机管理接口。删除仍被配置或 Access Key 使用的模型或
+工作区会失败。
+
+本机 Agent 配置会在 Agent 下次启动或恢复时自然生效；All API 模型配置的
+修改也只影响之后的新请求或新 Native 连接，不改写已经运行的连接。
 
 ## Agent 管理
 
@@ -137,7 +164,7 @@ all-api connector put my-agent \
   --command /absolute/path/to/connector \
   --args '[]' \
   --capabilities '{"input":["text"],"tools":[],"approvals":false,"continuation":true,"native":true,"usage":false}'
-all-api model put my-agent --agent my-agent
+all-api model put my-agent --agent my-agent --workspace default
 ```
 
 新增或替换连接器后重启服务，使 Agent 注册表重新加载。
@@ -168,12 +195,15 @@ all-api expose relay start --host user@example.com --remote-port 8787
   Agent 会话；Native 直接使用 Agent 会话。
 - Agent 是对话历史的唯一事实来源。All API 只保存 Response ID、Agent 会话
   ID、状态、模型、工作区和官方 usage，不保存提示词或回复正文。
+- Responses 的 `store:false` 不保存这条映射，因此之后不能查询或作为
+  `previous_response_id` 使用。
 - 明确上传的 Files 保存在本机、按 Key 隔离，直到调用者删除。
-- HTTP 客户端断线不会取消任务；只有 Responses cancel 或 Native 的官方中断
-  操作会取消。
+- HTTP 或 Native 客户端断线不会取消 Agent；只有 Responses cancel 或
+  Native 的官方中断操作会取消。All API 不保存 Native 事件用于重放。
 - 服务崩溃时，进行中的 Response 标记为 `interrupted`，不会自动重放。
 - usage 只在 Agent 返回真实数据时出现，不估算、不填零。
-- 达到全局并发上限时立即返回 busy 错误，不建立 All API 自己的排队系统。
+- 标准 API 达到并发上限时立即返回 busy；Native 只限制连接数、单帧大小和
+  待发送字节，不解析回合，也不建立 All API 自己的排队系统。
 - 默认不记录请求正文；仅在主动设置 `ALL_API_DEBUG=1` 时输出详细内部错误。
 
 ## 开发

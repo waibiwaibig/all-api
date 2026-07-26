@@ -21,7 +21,9 @@ test("CLI initializes, starts, reports health, and stops through local managemen
     assert.equal(initialized.models.includes("codex"), true);
     const configText = await readFile(path.join(directory, "config.json"), "utf8");
     assert.doesNotMatch(configText, /allapi_key_/);
-    assert.equal(JSON.parse(configText).version, 2);
+    const saved = JSON.parse(configText);
+    assert.equal(saved.version, 3);
+    assert.equal(saved.keys[Object.keys(saved.keys)[0]].defaultWorkspace, "default");
 
     const started = await run(["up"], env);
     pid = started.pid;

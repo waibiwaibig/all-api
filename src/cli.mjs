@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { adminEndpoint, adminRequest, createAdminServer } from "./admin.mjs";
 import { createDefaultRegistry } from "./agents.mjs";
-import { ConfigStore, createAccessKey } from "./core.mjs";
+import { ConfigStore, createApiKey } from "./core.mjs";
 import {
   configureCloudflare,
   detectAgents,
@@ -56,6 +56,7 @@ export async function main(argv) {
       profile: {
         agent: required(options.agent, "--agent"),
         source,
+        workspace: required(options.workspace, "--workspace"),
         ...(source === "managed"
           ? { overrides: jsonOption(options.overrides ?? "{}", "--overrides") }
           : {}),
@@ -81,10 +82,16 @@ export async function main(argv) {
   }
   if (command === "key" && subject === "create") {
     const catalog = await managementCall("catalog");
+    const kind = options.type ?? "access";
+    const workspaces = csv(options.workspaces) ?? catalog.workspaces.map((workspace) => workspace.id);
     return output(await managementCall("key.create", {
+      kind,
       name: required(positional[2], "key name"),
-      models: csv(options.models) ?? catalog.models.map((model) => model.id),
-      workspaces: csv(options.workspaces) ?? catalog.workspaces.map((workspace) => workspace.id),
+      ...(kind === "access" ? {
+        models: csv(options.models) ?? catalog.models.map((model) => model.id),
+        workspaces,
+        defaultWorkspace: options["default-workspace"] ?? workspaces[0],
+      } : {}),
     }));
   }
   if (command === "key" && subject === "revoke") {
@@ -97,6 +104,9 @@ export async function main(argv) {
         command: path.resolve(required(options.command, "--command")),
         args: jsonOption(options.args ?? "[]", "--args"),
         capabilities: jsonOption(required(options.capabilities, "--capabilities"), "--capabilities"),
+        ...(options.env ? { env: jsonOption(options.env, "--env") } : {}),
+        ...(options.version ? { version: options.version } : {}),
+        ...(options.native ? { native: jsonOption(options.native, "--native") } : {}),
       },
     }));
   }
@@ -134,12 +144,19 @@ async function initialize(options) {
   const installed = agents.filter((agent) => agent.installed);
   const models = Object.fromEntries(installed.map((agent) => [
     agent.name,
-    { agent: agent.name, source: "local" },
+    { agent: agent.name, source: "local", workspace: "default" },
   ]));
   const workspacePath = path.resolve(options.workspace ?? process.cwd());
   const config = {
-    version: 2,
-    server: { host: "127.0.0.1", port: numberOption(options.port, 8787), maxConcurrent: 4 },
+    version: 3,
+    server: {
+      host: "127.0.0.1",
+      port: numberOption(options.port, 8787),
+      maxConcurrent: 4,
+      maxNativeConnections: 8,
+      maxNativeFrameBytes: 1_048_576,
+      maxNativeBufferedBytes: 4_194_304,
+    },
     models,
     workspaces: { default: { path: workspacePath, label: path.basename(workspacePath) } },
     keys: {},
@@ -147,10 +164,12 @@ async function initialize(options) {
   };
   let token;
   if (installed.length) {
-    const created = await createAccessKey({
+    const created = await createApiKey({
+      kind: "access",
       name: "default",
       models: Object.keys(models),
       workspaces: ["default"],
+      defaultWorkspace: "default",
     });
     token = created.token;
     config.keys[created.record.id] = created.record;
@@ -161,7 +180,7 @@ async function initialize(options) {
     agents,
     models: Object.keys(models),
     workspace: workspacePath,
-    ...(token ? { key: token } : {
+    ...(token ? { accessKey: token } : {
       warning: "No supported Agent is installed; install one, add its model, then create a key",
     }),
   });
@@ -182,8 +201,16 @@ async function serve() {
   };
   const actions = {
     "agent.detect": () => detectAgents(),
-    "agent.install": ({ name }) => installAgent(name),
-    "agent.update": ({ name }) => updateAgent(name),
+    "agent.install": ({ name }) => {
+      const active = app.activity();
+      if (active.standard || active.native) throw new Error("Stop active Agent sessions before installing");
+      return installAgent(name);
+    },
+    "agent.update": ({ name }) => {
+      const active = app.activity();
+      if (active.standard || active.native) throw new Error("Stop active Agent sessions before updating");
+      return updateAgent(name);
+    },
     "autostart.set": ({ enabled }) => setAutostart({
       enabled: Boolean(enabled),
       dataDirectory,
@@ -214,6 +241,7 @@ async function serve() {
       for (const key of Object.keys(config)) delete config[key];
       Object.assign(config, structuredClone(next));
     },
+    onKeyRevoked: (keyId) => app.revokeKey(keyId),
     actions,
   });
   const address = await app.listen();
@@ -373,11 +401,14 @@ Setup and service:
   all-api autostart on|off
 
 Configuration (local management socket only):
-  all-api models | model put ID --agent NAME [--source local|managed] [--overrides JSON]
+  all-api models | model put ID --agent NAME --workspace ID
+      [--source local|managed] [--overrides JSON]
   all-api model delete ID
   all-api workspaces | workspace add ID PATH [--label TEXT] | workspace remove ID
-  all-api keys | key create NAME [--models a,b] [--workspaces x,y] | key revoke ID
-  all-api connectors | connector put ID --command PATH --capabilities JSON [--args JSON]
+  all-api keys | key create NAME [--type access|native]
+      [--models a,b] [--workspaces x,y] [--default-workspace ID]
+  all-api connectors | connector put ID --command PATH --capabilities JSON
+      [--args JSON] [--env JSON] [--version TEXT] [--native JSON]
   all-api connector delete ID
 
 Agents and exposure:

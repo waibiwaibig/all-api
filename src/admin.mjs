@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { createConnection, createServer } from "node:net";
 import { chmod, rm } from "node:fs/promises";
 import path from "node:path";
-import { createAccessKey, validateConfig } from "./core.mjs";
+import { createApiKey, validateConfig } from "./core.mjs";
 
 export function adminEndpoint(dataDirectory) {
   if (process.platform === "win32") {
@@ -17,6 +17,7 @@ export async function createAdminServer({
   getConfig,
   saveConfig,
   actions = {},
+  onKeyRevoked = async () => {},
 }) {
   if (process.platform !== "win32") await rm(endpoint, { force: true });
   let operations = Promise.resolve();
@@ -54,9 +55,17 @@ export async function createAdminServer({
     if (request.method === "catalog") return managementCatalog(config);
     if (request.method === "key.list") return publicKeys(config);
     if (request.method === "key.create") {
-      assertKnown(params.models, config.models, "model");
-      assertKnown(params.workspaces, config.workspaces, "workspace");
-      const created = await createAccessKey(params);
+      const kind = params.kind ?? "access";
+      if (kind === "access") {
+        assertKnown(params.models, config.models, "model");
+        assertKnown(params.workspaces, config.workspaces, "workspace");
+        if (!params.workspaces.includes(params.defaultWorkspace)) {
+          throw new Error("defaultWorkspace must be one of the granted workspaces");
+        }
+      } else if (kind !== "native") {
+        throw new Error("key kind must be access or native");
+      }
+      const created = await createApiKey({ ...params, kind });
       const next = structuredClone(config);
       next.keys[created.record.id] = created.record;
       await persist(next);
@@ -67,6 +76,7 @@ export async function createAdminServer({
       const next = structuredClone(config);
       delete next.keys[params.id];
       await persist(next);
+      await onKeyRevoked(params.id);
       return { revoked: params.id };
     }
     if (request.method === "profile.put") {
@@ -77,7 +87,8 @@ export async function createAdminServer({
     }
     if (request.method === "profile.delete") {
       requireEntry(config.models, params.id, "model");
-      const owner = Object.values(config.keys).find((key) => key.models.includes(params.id));
+      const owner = Object.values(config.keys).find((key) => key.kind === "access"
+        && key.models.includes(params.id));
       if (owner) throw new Error(`Model "${params.id}" is still granted to key "${owner.name}"`);
       const next = structuredClone(config);
       delete next.models[params.id];
@@ -92,8 +103,11 @@ export async function createAdminServer({
     }
     if (request.method === "workspace.delete") {
       requireEntry(config.workspaces, params.id, "workspace");
-      const owner = Object.values(config.keys).find((key) => key.workspaces.includes(params.id));
+      const owner = Object.values(config.keys).find((key) => key.kind === "access"
+        && key.workspaces.includes(params.id));
       if (owner) throw new Error(`Workspace "${params.id}" is still granted to key "${owner.name}"`);
+      const model = Object.entries(config.models).find(([, profile]) => profile.workspace === params.id);
+      if (model) throw new Error(`Workspace "${params.id}" is still used by model "${model[0]}"`);
       const next = structuredClone(config);
       delete next.workspaces[params.id];
       await persist(next);

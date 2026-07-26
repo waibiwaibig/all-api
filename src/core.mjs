@@ -47,8 +47,8 @@ export class ConfigStore {
 }
 
 export function validateConfig(config) {
-  if (!config || config.version !== 2) {
-    throw new Error("All API config must use version 2; legacy configs are intentionally not migrated");
+  if (!config || config.version !== 3) {
+    throw new Error("All API config must use version 3; legacy configs are intentionally not migrated");
   }
   for (const field of ["models", "workspaces", "keys", "connectors"]) {
     if (!isRecord(config[field])) throw new Error(`config.${field} must be an object`);
@@ -59,8 +59,14 @@ export function validateConfig(config) {
     || config.server.port < 0
     || config.server.port > 65535
     || !Number.isInteger(config.server.maxConcurrent)
-    || config.server.maxConcurrent < 1) {
-    throw new Error("config.server requires host, port 0-65535, and positive maxConcurrent");
+    || config.server.maxConcurrent < 1
+    || !Number.isInteger(config.server.maxNativeConnections)
+    || config.server.maxNativeConnections < 1
+    || !Number.isInteger(config.server.maxNativeFrameBytes)
+    || config.server.maxNativeFrameBytes < 1
+    || !Number.isInteger(config.server.maxNativeBufferedBytes)
+    || config.server.maxNativeBufferedBytes < 1) {
+    throw new Error("config.server requires host, port 0-65535, and positive concurrency and Native limits");
   }
 
   for (const [id, connector] of Object.entries(config.connectors)) {
@@ -71,7 +77,24 @@ export function validateConfig(config) {
       || !(connector.args ?? []).every((value) => typeof value === "string")
       || !isRecord(connector.capabilities)
       || !Array.isArray(connector.capabilities.input)
-      || !Array.isArray(connector.capabilities.tools)) {
+      || !Array.isArray(connector.capabilities.tools)
+      || !connector.capabilities.input.every((value) => typeof value === "string")
+      || !connector.capabilities.tools.every((value) => typeof value === "string")
+      || typeof connector.capabilities.native !== "boolean"
+      || (connector.env !== undefined && (
+        !isRecord(connector.env)
+        || !Object.values(connector.env).every((value) => typeof value === "string")
+      ))
+      || (connector.version !== undefined && typeof connector.version !== "string")
+      || (connector.native !== undefined && (
+        !isRecord(connector.native)
+        || typeof connector.native.transport !== "string"
+        || typeof connector.native.protocol !== "string"
+        || (connector.native.protocolVersion !== null
+          && typeof connector.native.protocolVersion !== "string")
+        || typeof connector.native.resumable !== "boolean"
+        || typeof connector.native.clientTools !== "boolean"
+      ))) {
       throw new Error(`connector "${id}" must declare an absolute command, string args, and capabilities`);
     }
   }
@@ -90,6 +113,9 @@ export function validateConfig(config) {
     if (model.source === "managed" && !isRecord(model.overrides)) {
       throw new Error(`managed model "${id}" must declare overrides`);
     }
+    if (typeof model.workspace !== "string" || !config.workspaces[model.workspace]) {
+      throw new Error(`model "${id}" uses unknown workspace "${model.workspace}"`);
+    }
   }
   for (const [id, workspace] of Object.entries(config.workspaces)) {
     assertId("workspace", id);
@@ -99,10 +125,22 @@ export function validateConfig(config) {
   }
   for (const [id, key] of Object.entries(config.keys)) {
     assertId("key", id);
-    if (!isRecord(key) || typeof key.hash !== "string") {
+    if (!isRecord(key)
+      || typeof key.name !== "string"
+      || typeof key.hash !== "string"
+      || !["access", "native"].includes(key.kind)) {
       throw new Error(`key "${id}" is invalid`);
     }
-    if (!Array.isArray(key.models) || !Array.isArray(key.workspaces)) {
+    if (key.kind === "native") {
+      if (key.models !== undefined || key.workspaces !== undefined || key.defaultWorkspace !== undefined) {
+        throw new Error(`native key "${id}" must not declare grants`);
+      }
+      continue;
+    }
+    if (!Array.isArray(key.models)
+      || key.models.length === 0
+      || !Array.isArray(key.workspaces)
+      || key.workspaces.length === 0) {
       throw new Error(`key "${id}" grants must be arrays`);
     }
     for (const model of key.models ?? []) {
@@ -113,47 +151,91 @@ export function validateConfig(config) {
         throw new Error(`key "${id}" grants unknown workspace "${workspace}"`);
       }
     }
+    if (!key.workspaces.includes(key.defaultWorkspace)) {
+      throw new Error(`key "${id}" defaultWorkspace must be one of its workspace grants`);
+    }
   }
   return config;
 }
 
-export async function createAccessKey({ name, models, workspaces }) {
+export async function createApiKey({
+  kind,
+  name,
+  models,
+  workspaces,
+  defaultWorkspace,
+}) {
+  if (!["access", "native"].includes(kind)) throw new Error("key kind must be access or native");
   if (!name?.trim()) throw new Error("key name is required");
+  if (kind === "native"
+    && (models !== undefined || workspaces !== undefined || defaultWorkspace !== undefined)) {
+    throw new Error("native keys must not declare grants");
+  }
+  if (kind === "access" && (
+    !Array.isArray(models)
+    || models.length === 0
+    || !Array.isArray(workspaces)
+    || workspaces.length === 0
+    || !workspaces.includes(defaultWorkspace)
+  )) {
+    throw new Error("access keys require models, workspaces, and a granted defaultWorkspace");
+  }
   const id = `key_${crypto.randomBytes(8).toString("hex")}`;
   const secret = crypto.randomBytes(32).toString("base64url");
-  const token = `allapi_${id}.${secret}`;
+  const token = `allapi_${kind}_${id}.${secret}`;
   const salt = crypto.randomBytes(16);
   const digest = await scrypt(token, salt, 32);
+  const grants = kind === "access"
+    ? {
+        models: [...new Set(models ?? [])],
+        workspaces: [...new Set(workspaces ?? [])],
+        defaultWorkspace,
+      }
+    : {};
   return {
     token,
     record: {
       id,
+      kind,
       name: name.trim(),
       hash: `scrypt:${salt.toString("base64url")}:${Buffer.from(digest).toString("base64url")}`,
-      models: [...new Set(models ?? [])],
-      workspaces: [...new Set(workspaces ?? [])],
+      ...grants,
       createdAt: new Date().toISOString(),
     },
   };
 }
 
-export async function authorize(config, token) {
-  if (typeof token !== "string" || !token.startsWith("allapi_")) {
+export async function authorize(config, token, expectedKind) {
+  const match = typeof token === "string"
+    ? /^allapi_(access|native)_(key_[a-f0-9]{16})\./.exec(token)
+    : null;
+  if (!match) {
     throw new HttpError(401, "Invalid API key", "invalid_api_key");
   }
-  const separator = token.indexOf(".", "allapi_".length);
-  if (separator < 0) throw new HttpError(401, "Invalid API key", "invalid_api_key");
-  const id = token.slice("allapi_".length, separator);
+  const [, kind, id] = match;
   const record = config.keys[id];
-  if (!record || !(await verifyKey(token, record.hash))) {
+  if (!record || record.kind !== kind || !(await verifyKey(token, record.hash))) {
     throw new HttpError(401, "Invalid API key", "invalid_api_key");
   }
-  return {
+  if (config.keys[id] !== record) {
+    throw new HttpError(401, "Invalid API key", "invalid_api_key");
+  }
+  if (expectedKind && kind !== expectedKind) {
+    throw new HttpError(403, `This endpoint requires an ${expectedKind} API key`, "permission_denied");
+  }
+  const identity = {
     keyId: id,
+    kind,
     name: record.name,
-    models: [...record.models],
-    workspaces: [...record.workspaces],
   };
+  return kind === "access"
+    ? {
+        ...identity,
+        models: [...record.models],
+        workspaces: [...record.workspaces],
+        defaultWorkspace: record.defaultWorkspace,
+      }
+    : identity;
 }
 
 export function requireGrant(grant, kind, id) {

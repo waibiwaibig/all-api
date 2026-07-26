@@ -6,21 +6,33 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
-import { createAccessKey } from "../src/core.mjs";
+import { createApiKey } from "../src/core.mjs";
 import { AgentRegistry } from "../src/agents.mjs";
 import { createAllApiServer } from "../src/server.mjs";
 
-async function fixture({ maxConcurrent = 4 } = {}) {
+async function fixture({
+  maxConcurrent = 4,
+  maxNativeConnections = 8,
+  maxNativeFrameBytes = 1_048_576,
+} = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-server-"));
-  const { token, record } = await createAccessKey({
+  const { token, record } = await createApiKey({
+    kind: "access",
     name: "test",
     models: ["fixture"],
     workspaces: ["demo"],
+    defaultWorkspace: "demo",
   });
-  const { token: otherToken, record: otherRecord } = await createAccessKey({
+  const { token: otherToken, record: otherRecord } = await createApiKey({
+    kind: "access",
     name: "other",
     models: ["fixture"],
     workspaces: ["demo"],
+    defaultWorkspace: "demo",
+  });
+  const { token: nativeToken, record: nativeRecord } = await createApiKey({
+    kind: "native",
+    name: "native",
   });
   const runs = [];
   const nativeInputs = [];
@@ -32,6 +44,9 @@ async function fixture({ maxConcurrent = 4 } = {}) {
       continuation: true,
       native: true,
       usage: true,
+    },
+    async describe() {
+      return { version: "fixture-1.0" };
     },
     async *run(request) {
       runs.push(request);
@@ -58,12 +73,12 @@ async function fixture({ maxConcurrent = 4 } = {}) {
         usage: { input_tokens: 3, output_tokens: 2 },
       };
     },
-    async openNative({ send, sessionId }) {
-      send({ type: "agent.ready", session_id: sessionId ?? "native-1" });
+    async openNative({ send }) {
+      send('{"type":"agent.ready","session_id":"native-1"}');
       return {
-        async receive(message) {
-          nativeInputs.push(message);
-          send({ type: "agent.echo", payload: message });
+        async receive(message, isBinary) {
+          nativeInputs.push({ message: Buffer.from(message), isBinary });
+          send(message, isBinary);
         },
         async close() {},
       };
@@ -72,14 +87,25 @@ async function fixture({ maxConcurrent = 4 } = {}) {
   const registry = new AgentRegistry();
   registry.register("fixture", adapter);
   const config = {
-    version: 2,
-    server: { host: "127.0.0.1", port: 0, maxConcurrent },
-    models: { fixture: { agent: "fixture", source: "local" } },
+    version: 3,
+    server: {
+      host: "127.0.0.1",
+      port: 0,
+      maxConcurrent,
+      maxNativeConnections,
+      maxNativeFrameBytes,
+      maxNativeBufferedBytes: 4_194_304,
+    },
+    models: { fixture: { agent: "fixture", source: "local", workspace: "demo" } },
     workspaces: {
       demo: { path: directory },
       hidden: { path: "/tmp/hidden" },
     },
-    keys: { [record.id]: record, [otherRecord.id]: otherRecord },
+    keys: {
+      [record.id]: record,
+      [otherRecord.id]: otherRecord,
+      [nativeRecord.id]: nativeRecord,
+    },
     connectors: {
       fixture: {
         command: process.execPath,
@@ -99,6 +125,8 @@ async function fixture({ maxConcurrent = 4 } = {}) {
     ...app,
     token,
     otherToken,
+    nativeToken,
+    nativeKeyId: nativeRecord.id,
     runs,
     nativeInputs,
     directory,
@@ -131,6 +159,9 @@ test("model and workspace discovery is filtered by the access key", async () => 
     const catalog = await (await request(app, "/allapi/v1/catalog")).json();
     assert.deepEqual(catalog.workspaces.map((item) => item.id), ["demo"]);
     assert.equal(catalog.models[0].capabilities.native, true);
+    assert.equal(catalog.models[0].agent_version, "fixture-1.0");
+    assert.equal(catalog.models[0].protocols.responses.client_tools, true);
+    assert.equal(catalog.default_workspace, "demo");
 
     const anthropic = await request(app, "/v1/models", undefined, {
       authorization: "",
@@ -160,7 +191,7 @@ test("Chat Completions is strict, streams officially shaped chunks, and preserve
       model: "fixture",
       messages: [{ role: "user", content: "hi" }],
       stream: false,
-    }, { "x-allapi-workspace": "demo" });
+    });
     const body = await response.json();
     assert.equal(body.object, "chat.completion");
     assert.equal(body.choices[0].message.content, "hello");
@@ -169,6 +200,7 @@ test("Chat Completions is strict, streams officially shaped chunks, and preserve
       completion_tokens: 2,
       total_tokens: 5,
     });
+    assert.equal(app.runs[0].workspace.id, "demo");
 
     const streamed = await request(app, "/v1/chat/completions", {
       model: "fixture",
@@ -204,6 +236,17 @@ test("Responses continuation stores only opaque metadata and reuses the agent se
 
     const metadata = JSON.stringify(app.responses.snapshot());
     assert.doesNotMatch(metadata, /private prompt/);
+
+    const ephemeral = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "temporary",
+      store: false,
+      metadata: { client: "test" },
+    });
+    const ephemeralBody = await ephemeral.json();
+    assert.deepEqual(ephemeralBody.metadata, { client: "test" });
+    const missing = await request(app, `/v1/responses/${ephemeralBody.id}`);
+    assert.equal(missing.status, 404);
   } finally {
     await app.cleanup();
   }
@@ -241,6 +284,19 @@ test("client tools use each standard protocol's official output shape", async ()
     const responseBody = await response.json();
     assert.equal(responseBody.output[0].type, "function_call");
     assert.equal(responseBody.output[0].name, "weather");
+
+    const forced = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "weather",
+      tools: [{
+        type: "function",
+        name: "weather",
+        parameters: { type: "object" },
+      }],
+      tool_choice: { type: "function", name: "weather" },
+    });
+    assert.equal(forced.status, 400);
+    assert.equal((await forced.json()).error.type, "unsupported_feature");
   } finally {
     await app.cleanup();
   }
@@ -280,26 +336,85 @@ test("Anthropic Messages uses Anthropic auth and error dialect", async () => {
   }
 });
 
-test("native WebSocket keeps the official payload unchanged in a thin envelope", async () => {
+test("native WebSocket forwards each official frame byte-for-byte without an envelope", async () => {
   const app = await fixture();
   try {
     const wsUrl = app.baseUrl.replace("http:", "ws:");
     const socket = new WebSocket(
-      `${wsUrl}/v1/native/sessions?model=fixture&workspace=demo`,
-      { headers: { authorization: `Bearer ${app.token}` } },
+      `${wsUrl}/v1/native/sessions?model=fixture`,
+      { headers: { authorization: `Bearer ${app.nativeToken}` } },
     );
     const messages = [];
-    socket.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    socket.on("message", (data) => messages.push(data.toString()));
     await once(socket, "open");
     while (messages.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(messages[0].payload.type, "agent.ready");
+    assert.equal(messages[0], '{"type":"agent.ready","session_id":"native-1"}');
 
-    const official = { method: "turn/steer", params: { input: "now test" } };
-    socket.send(JSON.stringify({ type: "agent.input", payload: official }));
+    const official = '{"method":"turn/steer","params":{"input":"now test"}}';
+    socket.send(official);
     while (messages.length < 2) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.deepEqual(messages[1].payload.payload, official);
+    assert.equal(messages[1], official);
+    assert.equal(app.nativeInputs[0].message.toString(), official);
     socket.close();
     await once(socket, "close");
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("native keys are isolated from standard APIs and revocation closes browser-authenticated sockets", async () => {
+  const app = await fixture();
+  try {
+    const denied = await fetch(`${app.baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${app.nativeToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "fixture", input: "no" }),
+    });
+    assert.equal(denied.status, 403);
+
+    const wsUrl = app.baseUrl.replace("http:", "ws:");
+    const accessSocket = new WebSocket(`${wsUrl}/v1/native/sessions?model=fixture`, {
+      headers: { authorization: `Bearer ${app.token}` },
+    });
+    const [accessError] = await once(accessSocket, "error");
+    assert.match(accessError.message, /403/);
+
+    const nativeSocket = new WebSocket(
+      `${wsUrl}/v1/native/sessions?model=fixture`,
+      ["allapi.native", app.nativeToken],
+    );
+    await once(nativeSocket, "open");
+    const closed = once(nativeSocket, "close");
+    await app.revokeKey(app.nativeKeyId);
+    const [code] = await closed;
+    assert.equal(code, 1008);
+  } finally {
+    await app.cleanup();
+  }
+});
+
+test("native transport enforces connection and frame limits without inspecting messages", async () => {
+  const app = await fixture({ maxNativeConnections: 1, maxNativeFrameBytes: 64 });
+  try {
+    const wsUrl = app.baseUrl.replace("http:", "ws:");
+    const first = new WebSocket(`${wsUrl}/v1/native/sessions?model=fixture`, {
+      headers: { authorization: `Bearer ${app.nativeToken}` },
+    });
+    await once(first, "open");
+
+    const second = new WebSocket(`${wsUrl}/v1/native/sessions?model=fixture`, {
+      headers: { authorization: `Bearer ${app.nativeToken}` },
+    });
+    const [limitError] = await once(second, "error");
+    assert.match(limitError.message, /429/);
+
+    const closed = once(first, "close");
+    first.send("x".repeat(65));
+    const [code] = await closed;
+    assert.equal(code, 1009);
   } finally {
     await app.cleanup();
   }

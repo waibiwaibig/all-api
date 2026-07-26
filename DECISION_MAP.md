@@ -50,6 +50,9 @@ Type: Discuss
 调用哪种接口，就严格使用哪家的官方输入、输出、流式事件和错误格式。标准接口中不加入 All API 私有字段。
 
 如果某项参数或能力不能准确实现，则明确失败；不能静默忽略，也不能假装成功。
+唯一的协议占位例外是 Anthropic Messages 必填的 `max_tokens`：Coding Agent
+没有对应的单次输出 token 上限，拒绝它会使所有 Messages 客户端都无法调用，
+所以接收但在能力目录明确标记 `max_tokens_enforced: false`。
 
 ## #3：整体架构如何分层？
 
@@ -71,9 +74,9 @@ flowchart LR
     end
 
     subgraph AllAPI["本机 All API"]
-        Access["网络入口与 Access Key"]
+        Access["网络入口\nAccess Key / Native Key"]
         Protocol["协议适配\nChat / Responses / Messages"]
-        Native["原生透传"]
+        Native["原生帧透传"]
         Router["模型、工作目录与权限选择"]
         CodexAdapter["Codex 连接器"]
         ClaudeAdapter["Claude 连接器"]
@@ -84,7 +87,7 @@ flowchart LR
 
     subgraph Agents["本机官方 Agent"]
         Codex["codex app-server"]
-        Claude["Claude Agent SDK\n调用本机 claude"]
+        Claude["Claude Agent SDK / stream-json\n调用本机 claude"]
         Other["其他 Agent 的官方接口"]
     end
 
@@ -134,7 +137,10 @@ Type: Research
 
 不通过模拟键盘、解析彩色终端界面或猜测提示文字实现正式连接。
 
-Native 模式只增加最薄的传输外壳。Agent 的官方事件内容保持不变，控制操作与官方操作一一对应。
+Native 模式不增加消息外壳。WebSocket 只负责承载目标 Agent 官方机器接口的
+帧：Codex 使用 app-server JSON-RPC，Claude 使用 Claude Code 官方双向
+`stream-json`（Agent SDK 底层使用的机器协议），连接器使用其声明的官方
+结构化接口。All API 核心不解析、分类、合并或改写这些帧。
 
 ## #5：模型、Agent 配置与工作目录是什么关系？
 
@@ -164,6 +170,10 @@ Type: Discuss
 - 调用时选择工作目录的名称或 ID。
 - 公网调用方不能提交任意本机绝对路径。
 - Access Key 分别限制可用模型和可用工作目录。
+- 每个 Access Key 必须选择一个已授权工作目录作为默认值，调用时可在授权
+  范围内覆盖。
+- Native 的工作目录是模型配置的启动默认值；官方 Native 消息能修改的内容
+  仍以官方消息为准。
 
 ```mermaid
 flowchart TB
@@ -171,7 +181,7 @@ flowchart TB
     Override["可选的 All API 配置覆盖"] --> Effective
     Model["调用方选择模型配置"] --> Effective
     Workspace["调用方选择已登记工作目录"] --> Effective
-    Key["Access Key\n允许的模型 + 工作目录"] --> Check{"是否允许"}
+    Key["Access Key\n允许的模型 + 工作目录\n默认工作目录"] --> Check{"是否允许"}
     Model --> Check
     Workspace --> Check
     Check -->|允许| Effective
@@ -196,14 +206,15 @@ sequenceDiagram
     participant A as All API
     participant G as 官方 Agent
 
-    C->>A: 请求 + Key + 模型 + 工作目录
-    A->>A: 验证 Key 和允许范围
+    C->>A: URL + Key + 模型
+    A->>A: 验证 Key 类型并选择模型
 
     alt 标准兼容接口
-        A->>A: 按对应官方格式解析
+        A->>A: 验证 Access Key 与工作目录\n按对应官方格式解析
         A->>G: 转换为 Agent 官方输入
     else Native
-        A->>G: 转发官方输入或控制操作
+        A->>A: Native Key 认证
+        A->>G: 原样转发 WebSocket 帧
     end
 
     G-->>A: 官方流式事件、工具事件、审批或错误
@@ -211,7 +222,7 @@ sequenceDiagram
     alt 标准兼容接口
         A-->>C: 转为对应官方响应与流式事件
     else Native
-        A-->>C: 原样转发官方事件
+        A-->>C: 原样转发 Agent 帧
     end
 ```
 
@@ -250,10 +261,12 @@ Type: Discuss
 不统一，只按来源处理：
 
 - Agent 自带工具由 Agent 自己执行。
-- 调用方声明的函数工具按相应官方 API 返回给调用方执行。
+- 调用方声明的函数工具只在目标适配器确实支持完整客户端工具回合时，按相应
+  官方 API 返回给调用方执行；不能把 Agent 自带工具冒充为调用方函数工具。
 - 无法准确对应的工具类型直接失败。
 - 权限模式属于 Agent 配置，All API 只传给 Agent。
-- Native 原样转发审批请求和审批结果。
+- Native 不识别“审批”类别；审批请求和结果只是 Agent 官方消息，和其他帧
+  一样原样传输。
 - 标准接口无法表示交互审批时，不能伪造，必须失败或要求使用非交互权限配置。
 - Codex 的引导、中断等能力直接映射到 `app-server` 官方操作。
 - Claude 的执行中输入、取消和审批直接使用 Agent SDK 官方能力。
@@ -345,9 +358,14 @@ Type: Discuss
 
 - 管理功能只开放给本机进程，通过操作系统本地通信与用户权限保护。
 - 不设置可以从公网使用的 Admin Key。
-- 公网 Access Key 只能调用 Agent、查询自己允许的模型和工作目录。
+- Access Key 只能调用标准 API，并查询自己允许的模型和工作目录。
+- Native Key 只用于 Native WebSocket，能连接本机全部 Native Agent；它
+  不含模型、配置或工作目录范围，也不能调用标准 API。
+- Native Key 可以创建多把以便分别撤销；撤销后所有使用该 Key 的现有
+  WebSocket 立即关闭。
 - 默认可以一键生成 Key。
-- 自定义 Key 可以选择允许的模型和已登记工作目录，但不能修改模型内部配置。
+- 自定义 Access Key 可以选择允许的模型、已登记工作目录和一个默认工作目录，
+  但不能修改模型内部配置。
 - 模型列表和工作目录列表都按当前 Key 过滤。
 - Agent 的安装、更新、配置修改、Key 管理和公网连接设置只能在本机操作。
 
@@ -364,10 +382,14 @@ All API 是否应该统一错误和能力描述？
 
 - OpenAI 入口返回 OpenAI 官方错误格式。
 - Anthropic 入口返回 Anthropic 官方错误格式。
-- Native 原样转发 Agent 官方错误事件。
+- Native 中 Agent 的官方错误事件仍原样转发。WebSocket 升级前的认证、模型
+  和容量错误使用 HTTP 状态；升级后的纯传输故障只使用 WebSocket close
+  code，不注入 All API 私有错误消息。
 - Agent 的失败反馈就是输出；All API 不隐藏、不自动修复、不自动重跑。
 - 标准模型列表保持对应官方格式。
-- 另提供清晰的 All API 能力查询，供设置界面或高级客户端提前判断图片、文件、工具、审批等支持情况。
+- 另提供清晰的 All API 能力查询，列出安装的 Agent 版本、Native 传输与
+  官方协议、协议版本（未知时明确为 `null`）、续接、客户端工具、审批、
+  图片、文件和真实 usage 支持。
 - 用量只采用 Agent 官方返回的真实数据；没有真实数据时标记为不可用，不能估算。
 - 每个请求生成追踪标识，但默认日志不记录请求正文。
 
@@ -383,12 +405,15 @@ Type: Discuss
 ### Answer
 
 - 不同会话可以并行。
-- 设置可调整的全局并发上限。
-- 达到上限时返回繁忙，不由 All API 排队。
+- 标准 API 设置可调整的全局执行并发上限；达到上限时立即返回繁忙，不由
+  All API 排队。
+- Native 不解析回合，所以不参与标准执行并发计数；它只设置连接数、单帧
+  大小和待发送字节限制，保持每条连接内的顺序并施加背压。
 - 同一会话的并发行为完全服从 Agent 官方规则。
 - 客户端断线后任务继续，明确取消才停止。
 - 电脑休眠时遵循操作系统和 Agent 的自然行为。
-- All API 或 Agent 崩溃后，正在执行的任务标记为中断，不自动重跑。
+- All API 或 Agent 崩溃后，Responses 中的进行中映射标记为中断，不自动
+  重跑；Agent 自己的失败反馈仍作为输出。
 - 已保存会话仍由 Agent 自己恢复。
 - 开机或登录自动启动是用户可以打开或关闭的功能，不强制开启。
 
@@ -408,7 +433,6 @@ All API 的本地管理功能提供：
 - 检测 Agent 是否安装及当前版本。
 - 一键下载安装。
 - 检查并执行更新。
-- 可选自动更新。
 
 安装和更新只调用 Agent 官方发布渠道、安装器和更新机制；All API 不重新托管或修改 Agent。
 
@@ -427,7 +451,7 @@ All API 默认保存哪些内容？
 
 默认只保存运行所需的最少信息：
 
-- Access Key 的哈希，不保存可恢复的明文 Key。
+- Access Key 和 Native Key 的哈希，不保存可恢复的明文 Key。
 - 模型配置覆盖、已登记工作目录和权限关系。
 - 会话定位所需的不透明映射。
 - 时间、状态、耗时、真实用量和错误类别等元数据。
@@ -496,11 +520,15 @@ Type: Discuss
 至少满足以下结果：
 
 1. 常见 OpenAI 和 Anthropic 客户端只替换地址、Key 和模型名称即可调用。
-2. Native 客户端能收到 Agent 官方的完整事件、审批和控制能力。
+2. Native 客户端的每个输入和输出帧在 All API 核心中保持字节不变；能否
+   解释该帧完全由目标 Agent 的官方机器接口决定。
 3. 无法无损表达的能力会明确失败，而不是丢失。
 4. 默认直接继承本机 Agent 配置和会话。
-5. Access Key 只能访问被授权的模型和已登记工作目录。
+5. Access Key 只能访问被授权的模型和已登记工作目录，并有明确默认目录；
+   Native Key 与标准接口隔离，撤销会立即断开现有 Native 连接。
 6. 本机、Cloudflare、Tailscale 和自有 relay 场景都能工作。
 7. Codex、Claude 可以通过本地管理功能检测、安装和更新。
 8. 新 Agent 可以通过本地连接器加入，而无需重写网络、安全和标准协议层。
 9. 默认日志和存储不复制用户对话或文件内容。
+10. 能力目录真实公开各接口会失败的能力、Agent/协议版本、续接、工具与审批
+    支持；未知信息不猜测。

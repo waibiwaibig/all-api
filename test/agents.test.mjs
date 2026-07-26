@@ -31,6 +31,24 @@ test("Codex adapter speaks app-server JSON-RPC and preserves the thread id", asy
   assert.deepEqual(events.at(-1).usage, { input_tokens: 8, output_tokens: 2 });
 });
 
+test("Codex native transport passes app-server JSON-RPC frames without an All API envelope", async () => {
+  const adapter = new CodexAdapter({
+    executable: process.execPath,
+    appServerArgs: [fakeCodex],
+  });
+  const outputs = [];
+  const native = await adapter.openNative({
+    send: (frame) => outputs.push(frame),
+    fail: (error) => { throw error; },
+    workspace,
+  });
+  const input = '{"id":"raw-1","method":"initialize","params":{}}';
+  await native.receive(Buffer.from(input), false);
+  const reply = await waitFor(() => outputs[0]);
+  assert.equal(reply, '{"id":"raw-1","result":{"userAgent":"fake-codex"}}');
+  await native.close();
+});
+
 test("Claude adapter consumes official SDK messages and resumes the SDK session", async () => {
   const calls = [];
   const adapter = new ClaudeAdapter({
@@ -69,41 +87,21 @@ test("Claude adapter consumes official SDK messages and resumes the SDK session"
   assert.equal(events[1].sessionId, "claude-session-1");
 });
 
-test("Claude native transport keeps streaming input and bridges official permission callbacks", async () => {
+test("Claude native transport forwards official stream-json frames without interpreting controls", async () => {
   const outputs = [];
-  let permissionResult;
   const adapter = new ClaudeAdapter({
-    executable: "/usr/local/bin/claude",
-    query({ prompt, options }) {
-      const stream = (async function* () {
-        for await (const message of prompt) {
-          yield { type: "user_echo", message };
-          permissionResult = await options.canUseTool("Bash", { command: "pwd" }, {
-            signal: new AbortController().signal,
-            requestId: "permission-1",
-            toolUseID: "tool-1",
-            suggestions: [],
-          });
-          yield { type: "result", session_id: "claude-native-1", permissionResult };
-        }
-      })();
-      stream.interrupt = async () => {};
-      stream.setPermissionMode = async () => {};
-      stream.setModel = async () => {};
-      return stream;
-    },
+    executable: process.execPath,
+    nativeArgs: [fakeCodex],
   });
-  const native = await adapter.openNative({ send: (message) => outputs.push(message), workspace, profile });
-  await native.receive("hello");
-  await waitFor(() => outputs.find((message) => message.type === "permission_request"));
-  assert.equal(outputs.find((message) => message.type === "permission_request").request_id, "permission-1");
-  await native.receive({
-    type: "permission_response",
-    request_id: "permission-1",
-    result: { behavior: "allow", updatedInput: { command: "pwd" } },
+  const native = await adapter.openNative({
+    send: (message) => outputs.push(message),
+    fail: (error) => { throw error; },
+    workspace,
+    profile,
   });
-  await waitFor(() => outputs.find((message) => message.type === "result"));
-  assert.equal(permissionResult.behavior, "allow");
+  const input = '{"type":"control_response","response":{"subtype":"success","request_id":"permission-1"}}';
+  await native.receive(Buffer.from(input), false);
+  assert.equal(await waitFor(() => outputs[0]), input);
   await native.close();
 });
 

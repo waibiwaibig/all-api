@@ -25,6 +25,7 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
   const gate = new ConcurrencyGate(config.server.maxConcurrent);
   const controllers = new Set();
   const nativeSessions = new Set();
+  const nativeSessionsByKey = new Map();
   const server = createServer(async (request, response) => {
     try {
       await route({ request, response, config, registry, responses, files, gate, controllers });
@@ -38,13 +39,17 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   });
-  const webSockets = new WebSocketServer({ noServer: true });
+  const webSockets = new WebSocketServer({
+    noServer: true,
+    handleProtocols(protocols) {
+      return protocols.has("allapi.native") ? "allapi.native" : false;
+    },
+  });
   server.on("upgrade", (request, socket, head) => {
     handleUpgrade({
-      request, socket, head, config, registry, webSockets, gate, nativeSessions,
-    }).catch(() => {
-      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-      socket.destroy();
+      request, socket, head, config, registry, webSockets, nativeSessions, nativeSessionsByKey,
+    }).catch((error) => {
+      rejectUpgrade(socket, error);
     });
   });
 
@@ -53,6 +58,14 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
     registry,
     responses,
     files,
+    activity() {
+      return { standard: gate.active, native: nativeSessions.size };
+    },
+    async revokeKey(keyId) {
+      await Promise.allSettled(
+        [...(nativeSessionsByKey.get(keyId) ?? [])].map((close) => close(1008, "API key revoked")),
+      );
+    },
     async listen() {
       await new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -89,15 +102,16 @@ async function route(context) {
   }
   if (request.method === "GET" && url.pathname.startsWith("/v1/models/")) {
     const id = decodeURIComponent(url.pathname.slice("/v1/models/".length));
-    requireGrant(grant, "model", id);
+    requireModelVisible(config, grant, id);
     if (!config.models[id]) throw new HttpError(404, `Model "${id}" not found`, "not_found");
     return sendJson(response, 200, request.headers["anthropic-version"]
       ? anthropicModel(context, id)
       : openAiModel(context, id));
   }
   if (request.method === "GET" && url.pathname === "/allapi/v1/catalog") {
-    return sendJson(response, 200, catalog(context, grant));
+    return sendJson(response, 200, await catalog(context, grant));
   }
+  requireAccessKey(grant);
   if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
     return chatCompletions(context, grant);
   }
@@ -121,10 +135,18 @@ async function chatCompletions(context, grant) {
   const { request, response } = context;
   const body = strictObject(await readJson(request), CHAT_FIELDS, ["model", "messages"]);
   ensureArray(body.messages, "messages");
+  optionalBoolean(body.stream, "stream");
+  optionalBoolean(body.parallel_tool_calls, "parallel_tool_calls");
+  if (body.stream_options !== undefined) {
+    strictObject(body.stream_options, ["include_usage"]);
+    optionalBoolean(body.stream_options.include_usage, "stream_options.include_usage");
+  }
+  rejectUnsupported(body, ["metadata", "user"]);
+  assertParallelTools(body.parallel_tool_calls);
   const converted = chatInput(body.messages);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
     ...converted,
-    tools: validateOpenAiTools(body.tools),
+    tools: applyOpenAiToolChoice(validateOpenAiTools(body.tools), body.tool_choice),
   });
   if (body.stream) {
     startSse(response);
@@ -208,6 +230,17 @@ async function chatCompletions(context, grant) {
 async function createResponse(context, grant) {
   const { request, response, responses } = context;
   const body = strictObject(await readJson(request), RESPONSE_FIELDS, ["model", "input"]);
+  optionalBoolean(body.stream, "stream");
+  optionalBoolean(body.store, "store");
+  optionalBoolean(body.parallel_tool_calls, "parallel_tool_calls");
+  if (body.metadata !== undefined && (
+    body.metadata === null
+    || typeof body.metadata !== "object"
+    || Array.isArray(body.metadata)
+  )) {
+    throw new HttpError(400, "'metadata' must be an object", "invalid_request_error", "metadata");
+  }
+  assertParallelTools(body.parallel_tool_calls);
   const previous = body.previous_response_id
     ? responses.require(body.previous_response_id, grant.keyId)
     : undefined;
@@ -217,7 +250,7 @@ async function createResponse(context, grant) {
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
     input: responseInput(body.input),
     instructions: body.instructions,
-    tools: validateResponseTools(body.tools),
+    tools: applyOpenAiToolChoice(validateResponseTools(body.tools), body.tool_choice),
     sessionId: previous?.agentSessionId,
   });
   const record = responses.create({
@@ -225,6 +258,8 @@ async function createResponse(context, grant) {
     keyId: grant.keyId,
     model: body.model,
     workspace: run.workspace,
+    metadata: body.metadata ?? {},
+    persist: body.store !== false,
     controller: run.controller,
   });
   if (body.stream) {
@@ -321,6 +356,7 @@ async function createResponse(context, grant) {
           response: completed,
           sequence_number: sequence++,
         }, "response.completed");
+        if (!record.persist) responses.delete(record.id);
       }
     }
     return response.end();
@@ -332,11 +368,14 @@ async function createResponse(context, grant) {
       agentSessionId: result.sessionId,
       usage: result.usage,
     });
-    return sendJson(response, 200, responseEnvelope(
+    const resultBody = responseEnvelope(
       record, "completed", result.text, result.usage, result.toolCalls,
-    ));
+    );
+    if (!record.persist) responses.delete(record.id);
+    return sendJson(response, 200, resultBody);
   } catch (error) {
     responses.fail(record.id, error);
+    if (!record.persist) responses.delete(record.id);
     throw error;
   }
 }
@@ -363,10 +402,15 @@ async function messages(context, grant) {
   const { request, response } = context;
   const body = strictObject(await readJson(request), MESSAGE_FIELDS, ["model", "max_tokens", "messages"]);
   ensureArray(body.messages, "messages");
+  optionalBoolean(body.stream, "stream");
+  if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1) {
+    throw new HttpError(400, "'max_tokens' must be a positive integer", "invalid_request_error", "max_tokens");
+  }
+  rejectUnsupported(body, ["metadata", "stop_sequences"]);
   const converted = anthropicInput(body.messages, body.system);
   const run = await prepareRun(context, grant, body.model, request.headers["x-allapi-workspace"], {
     ...converted,
-    tools: validateAnthropicTools(body.tools),
+    tools: applyAnthropicToolChoice(validateAnthropicTools(body.tools), body.tool_choice),
   });
   const messageId = run.id.replace("chatcmpl_", "msg_");
   if (body.stream) {
@@ -557,97 +601,90 @@ async function filesRoute(context, grant, url) {
 }
 
 async function handleUpgrade({
-  request, socket, head, config, registry, webSockets, gate, nativeSessions,
+  request, socket, head, config, registry, webSockets, nativeSessions, nativeSessionsByKey,
 }) {
   const url = new URL(request.url, "http://all-api.local");
-  if (url.pathname !== "/v1/native/sessions") throw new Error("not found");
-  const grant = await authorize(config, bearerOrApiKey(request));
+  if (url.pathname !== "/v1/native/sessions") {
+    throw new HttpError(404, "Native endpoint not found", "not_found");
+  }
+  const grant = await authorize(config, bearerOrApiKey(request), "native");
   const modelId = url.searchParams.get("model");
-  const workspaceId = url.searchParams.get("workspace") || defaultWorkspace(grant);
-  requireGrant(grant, "model", modelId);
-  requireGrant(grant, "workspace", workspaceId);
+  if (!modelId) throw new HttpError(400, "model query parameter is required");
+  if ([...url.searchParams.keys()].some((name) => name !== "model")) {
+    throw new HttpError(400, "Native accepts only the model query parameter");
+  }
   const profile = config.models[modelId];
-  const workspace = config.workspaces[workspaceId];
+  if (!profile) throw new HttpError(404, `Model "${modelId}" does not exist`, "model_not_found");
+  const workspaceId = profile.workspace;
+  const workspace = workspaceId ? config.workspaces[workspaceId] : undefined;
   const adapter = registry.get(profile.agent);
   if (!adapter.capabilities.native || !adapter.openNative) {
-    throw new Error(`Model "${modelId}" has no native transport`);
+    throw new HttpError(400, `Model "${modelId}" has no native transport`);
+  }
+  if (nativeSessions.size >= config.server.maxNativeConnections) {
+    throw new HttpError(429, "Native connection limit reached", "server_busy");
   }
   webSockets.handleUpgrade(request, socket, head, async (webSocket) => {
     let native;
-    let activeRelease;
-    let disconnected = false;
-    const closeNative = async () => {
+    let closed = false;
+    const closeNative = async (code, reason) => {
+      if (closed) return;
+      closed = true;
       const current = native;
-      if (!current) return;
       native = undefined;
       nativeSessions.delete(closeNative);
-      activeRelease?.();
-      activeRelease = undefined;
-      await current.close();
+      const keyed = nativeSessionsByKey.get(grant.keyId);
+      keyed?.delete(closeNative);
+      if (keyed?.size === 0) nativeSessionsByKey.delete(grant.keyId);
+      if (code && webSocket.readyState === webSocket.OPEN) webSocket.close(code, reason);
+      await current?.close();
     };
     try {
+      nativeSessions.add(closeNative);
+      const keyed = nativeSessionsByKey.get(grant.keyId) ?? new Set();
+      keyed.add(closeNative);
+      nativeSessionsByKey.set(grant.keyId, keyed);
       native = await adapter.openNative({
         profile,
-        workspace: { id: workspaceId, ...workspace },
-        sessionId: url.searchParams.get("session_id") || undefined,
-        send(payload) {
-          if (isNativeCompletion(payload)) {
-            activeRelease?.();
-            activeRelease = undefined;
-            if (disconnected) closeNative().catch(() => {});
+        workspace: workspace ? { id: workspaceId, ...workspace } : undefined,
+        send(frame, isBinary = Buffer.isBuffer(frame)) {
+          if (webSocket.readyState !== webSocket.OPEN) return;
+          const bytes = Buffer.isBuffer(frame) ? frame.byteLength : Buffer.byteLength(String(frame));
+          if (bytes > config.server.maxNativeFrameBytes) {
+            webSocket.close(1009, "Native frame limit exceeded");
+            return;
           }
-          if (webSocket.readyState === webSocket.OPEN) {
-            webSocket.send(JSON.stringify({ type: "agent.event", payload }));
+          if (webSocket.bufferedAmount + bytes > config.server.maxNativeBufferedBytes) {
+            webSocket.close(1009, "Native output buffer limit exceeded");
+            return;
           }
+          webSocket.send(frame, { binary: isBinary });
+        },
+        fail(error) {
+          const normal = error?.exitCode === 0 && !error.signal;
+          closeNative(
+            normal ? 1000 : 1011,
+            normal ? "Agent transport ended" : String(error?.message ?? error).slice(0, 120),
+          ).catch(() => {});
         },
       });
-      nativeSessions.add(closeNative);
-      webSocket.on("message", async (data) => {
-        let acquired = false;
-        try {
-          const envelope = JSON.parse(data.toString());
-          if (envelope.type !== "agent.input" || envelope.payload === undefined) {
-            throw new Error("Native messages require {type:'agent.input', payload}");
-          }
-          if (isNativeTurnStart(envelope.payload) && !activeRelease) {
-            activeRelease = gate.acquire();
-            acquired = true;
-          }
-          await native.receive(envelope.payload);
-        } catch (error) {
-          if (acquired) {
-            activeRelease?.();
-            activeRelease = undefined;
-          }
-          if (webSocket.readyState === webSocket.OPEN) {
-            webSocket.send(JSON.stringify({
-              type: "transport.error",
-              error: { message: error.message },
-            }));
-          }
+      let incoming = Promise.resolve();
+      webSocket.on("message", (data, isBinary) => {
+        if (data.byteLength > config.server.maxNativeFrameBytes) {
+          webSocket.close(1009, "Native frame limit exceeded");
+          return;
         }
-      });
-      webSocket.once("close", () => {
-        disconnected = true;
-        if (!activeRelease) closeNative().catch(() => {});
+        incoming = incoming.then(() => native.receive(data, isBinary)).catch((error) => {
+          if (webSocket.readyState === webSocket.OPEN) {
+            webSocket.close(1011, String(error?.message ?? error).slice(0, 120));
+          }
+        });
       });
     } catch (error) {
+      await closeNative();
       webSocket.close(1011, error.message.slice(0, 120));
     }
   });
-}
-
-function isNativeCompletion(payload) {
-  return payload?.method === "turn/completed"
-    || payload?.method === "turn/failed"
-    || payload?.type === "result"
-    || payload?.type === "transport.exit";
-}
-
-function isNativeTurnStart(payload) {
-  return payload?.method === "turn/start"
-    || payload?.type === "user"
-    || typeof payload === "string";
 }
 
 export class ResponseStore {
@@ -729,7 +766,7 @@ export class ResponseStore {
   }
 
   snapshot() {
-    return [...this.#records.values()].map(({ controller, keyId, ...record }) => ({ ...record }));
+    return [...this.#records.values()].map(({ controller, keyId, persist, ...record }) => ({ ...record }));
   }
 
   flush() {
@@ -741,7 +778,9 @@ export class ResponseStore {
     this.#saving = this.#saving.catch(() => {}).then(async () => {
       await mkdir(path.dirname(this.filename), { recursive: true, mode: 0o700 });
       const temporary = `${this.filename}.${process.pid}.${crypto.randomUUID()}.tmp`;
-      const records = [...this.#records.values()].map(({ controller, ...record }) => record);
+      const records = [...this.#records.values()]
+        .filter((record) => record.persist !== false)
+        .map(({ controller, persist, ...record }) => record);
       await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
       await rename(temporary, this.filename);
     });
@@ -835,7 +874,7 @@ const MESSAGE_FIELDS = [
 function openAiModels({ config, registry }, grant) {
   return {
     object: "list",
-    data: grant.models.filter((id) => config.models[id]).map((id) => openAiModel({ config }, id)),
+    data: visibleModels(config, grant).map((id) => openAiModel({ config }, id)),
   };
 }
 
@@ -849,7 +888,7 @@ function openAiModel({ config }, id) {
 }
 
 function anthropicModels(context, grant) {
-  const data = grant.models.filter((id) => context.config.models[id]).map((id) => anthropicModel(context, id));
+  const data = visibleModels(context.config, grant).map((id) => anthropicModel(context, id));
   return {
     data,
     first_id: data[0]?.id ?? null,
@@ -876,52 +915,77 @@ function anthropicModel({ config, registry }, id) {
   };
 }
 
-function catalog({ config, registry }, grant) {
+async function catalog({ config, registry }, grant) {
+  const models = await Promise.all(visibleModels(config, grant).map(async (id) => {
+    const profile = config.models[id];
+    const adapter = registry.get(profile.agent);
+    const description = await adapter.describe?.() ?? {};
+    const clientTools = adapter.capabilities.tools.includes("client");
+    return {
+      id,
+      agent: profile.agent,
+      agent_version: description.version ?? null,
+      source: profile.source,
+      workspace: profile.workspace ?? null,
+      capabilities: adapter.capabilities,
+      protocols: {
+        chat_completions: {
+          supported: true,
+          parameters: CHAT_FIELDS,
+          client_tools: clientTools,
+          tool_choice: clientTools ? ["auto", "none"] : [],
+          parallel_tool_calls_false: false,
+          unsupported_parameters: ["metadata", "user"],
+          interactive_approvals: false,
+        },
+        responses: {
+          supported: true,
+          parameters: RESPONSE_FIELDS,
+          client_tools: clientTools,
+          tool_choice: clientTools ? ["auto", "none"] : [],
+          parallel_tool_calls_false: false,
+          interactive_approvals: false,
+        },
+        messages: {
+          supported: true,
+          parameters: MESSAGE_FIELDS,
+          client_tools: clientTools,
+          tool_choice: clientTools ? ["auto", "none"] : [],
+          max_tokens_enforced: false,
+          unsupported_parameters: ["metadata", "stop_sequences"],
+          interactive_approvals: false,
+        },
+        native: {
+          supported: Boolean(adapter.capabilities.native),
+          lossless_agent_events: Boolean(adapter.capabilities.native),
+          interactive_approvals: Boolean(adapter.capabilities.approvals),
+          transport: adapter.native?.transport ?? null,
+          protocol: adapter.native?.protocol ?? null,
+          protocol_version: adapter.native?.protocolVersion ?? null,
+          resumable: Boolean(adapter.native?.resumable),
+          client_tools: Boolean(adapter.native?.clientTools),
+        },
+      },
+      unsupported_behavior: "error",
+      usage: adapter.capabilities.usage ? "official_agent_data_only" : "unavailable",
+    };
+  }));
   return {
     object: "allapi.catalog",
     limits: {
       json_body_bytes: MAX_JSON_BYTES,
       file_upload_bytes: MAX_FILE_BYTES,
-      global_concurrency: config.server.maxConcurrent,
+      standard_concurrency: config.server.maxConcurrent,
+      native_connections: config.server.maxNativeConnections,
+      native_frame_bytes: config.server.maxNativeFrameBytes,
+      native_buffered_bytes: config.server.maxNativeBufferedBytes,
     },
-    models: grant.models.filter((id) => config.models[id]).map((id) => {
-      const profile = config.models[id];
-      const adapter = registry.get(profile.agent);
-      return {
-        id,
-        agent: profile.agent,
-        source: profile.source,
-        capabilities: adapter.capabilities,
-        protocols: {
-          chat_completions: {
-            supported: true,
-            parameters: CHAT_FIELDS,
-            interactive_approvals: false,
-          },
-          responses: {
-            supported: true,
-            parameters: RESPONSE_FIELDS,
-            interactive_approvals: false,
-          },
-          messages: {
-            supported: true,
-            parameters: MESSAGE_FIELDS,
-            interactive_approvals: false,
-          },
-          native: {
-            supported: Boolean(adapter.capabilities.native),
-            lossless_agent_events: Boolean(adapter.capabilities.native),
-            interactive_approvals: Boolean(adapter.capabilities.approvals),
-          },
-        },
-        unsupported_behavior: "error",
-        usage: adapter.capabilities.usage ? "official_agent_data_only" : "unavailable",
-      };
-    }),
-    workspaces: grant.workspaces.filter((id) => config.workspaces[id]).map((id) => ({
+    models,
+    workspaces: visibleWorkspaces(config, grant).map((id) => ({
       id,
       label: config.workspaces[id].label ?? id,
     })),
+    default_workspace: grant.kind === "access" ? grant.defaultWorkspace : null,
   };
 }
 
@@ -932,6 +996,7 @@ function responseEnvelope(record, status, text, usage, toolCalls = []) {
     created_at: record.createdAt,
     status,
     model: record.model,
+    metadata: record.metadata ?? {},
     output: text === undefined ? [] : [
       ...(text ? [{
         ...responseMessage(record, text, "completed"),
@@ -1121,6 +1186,58 @@ function validateAnthropicTools(tools) {
   ], ["name", "input_schema"]));
 }
 
+function applyOpenAiToolChoice(tools, choice) {
+  if (choice === undefined || choice === "auto") return tools;
+  if (choice === "none") return [];
+  throw new HttpError(
+    400,
+    "Forced tool_choice is not supported by Agent compatibility adapters",
+    "unsupported_feature",
+    "tool_choice",
+  );
+}
+
+function applyAnthropicToolChoice(tools, choice) {
+  if (choice === undefined || choice?.type === "auto") return tools;
+  if (choice?.type === "none") return [];
+  throw new HttpError(
+    400,
+    "Forced tool_choice is not supported by Agent compatibility adapters",
+    "unsupported_feature",
+    "tool_choice",
+  );
+}
+
+function assertParallelTools(value) {
+  if (value === false) {
+    throw new HttpError(
+      400,
+      "parallel_tool_calls=false cannot be guaranteed by Agent compatibility adapters",
+      "unsupported_feature",
+      "parallel_tool_calls",
+    );
+  }
+}
+
+function rejectUnsupported(body, fields) {
+  for (const field of fields) {
+    if (body[field] !== undefined) {
+      throw new HttpError(
+        400,
+        `'${field}' is not supported by Agent compatibility adapters`,
+        "unsupported_feature",
+        field,
+      );
+    }
+  }
+}
+
+function optionalBoolean(value, field) {
+  if (value !== undefined && typeof value !== "boolean") {
+    throw new HttpError(400, `'${field}' must be a boolean`, "invalid_request_error", field);
+  }
+}
+
 function assertCapabilities(capabilities, input, tools) {
   if (input.some((block) => block.type === "tool_call" || block.type === "tool_result")
     && !capabilities.tools.includes("client")) {
@@ -1186,7 +1303,36 @@ function bearerOrApiKey(request) {
   const authorization = request.headers.authorization;
   if (authorization?.startsWith("Bearer ")) return authorization.slice(7);
   if (typeof request.headers["x-api-key"] === "string") return request.headers["x-api-key"];
+  const protocols = String(request.headers["sec-websocket-protocol"] ?? "")
+    .split(",")
+    .map((value) => value.trim());
+  const nativeKey = protocols.find((value) => value.startsWith("allapi_native_"));
+  if (nativeKey) return nativeKey;
   throw new HttpError(401, "Missing API key", "invalid_api_key");
+}
+
+function requireAccessKey(grant) {
+  if (grant.kind !== "access") {
+    throw new HttpError(403, "This endpoint requires an access API key", "permission_denied");
+  }
+}
+
+function visibleModels(config, grant) {
+  return grant.kind === "native"
+    ? Object.keys(config.models)
+    : grant.models.filter((id) => config.models[id]);
+}
+
+function visibleWorkspaces(config, grant) {
+  return grant.kind === "native"
+    ? Object.keys(config.workspaces)
+    : grant.workspaces.filter((id) => config.workspaces[id]);
+}
+
+function requireModelVisible(config, grant, id) {
+  if (!visibleModels(config, grant).includes(id)) {
+    throw new HttpError(403, `model "${id}" is not allowed by this API key`, "permission_denied");
+  }
 }
 
 function requireAnthropicVersion(request) {
@@ -1195,13 +1341,30 @@ function requireAnthropicVersion(request) {
   }
 }
 
+function rejectUpgrade(socket, error) {
+  const status = error instanceof HttpError ? error.status : 500;
+  const reason = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    429: "Too Many Requests",
+  }[status] ?? "Internal Server Error";
+  const body = `${error?.message ?? reason}\n`;
+  socket.end(
+    `HTTP/1.1 ${status} ${reason}\r\n`
+    + "Connection: close\r\n"
+    + "Content-Type: text/plain; charset=utf-8\r\n"
+    + `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+  );
+}
+
 function workspaceId(request, grant) {
   return request.headers["x-allapi-workspace"] || defaultWorkspace(grant);
 }
 
 function defaultWorkspace(grant) {
-  if (grant.workspaces.length === 1) return grant.workspaces[0];
-  throw new HttpError(400, "x-allapi-workspace is required when a key grants multiple workspaces");
+  return grant.defaultWorkspace;
 }
 
 async function readJson(request) {

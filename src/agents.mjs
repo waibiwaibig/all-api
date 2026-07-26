@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -55,6 +54,8 @@ export class JsonLinePeer {
   #nextId = 1;
   #pending = new Map();
   #listeners = new Set();
+  #rawListeners = new Set();
+  #failureListeners = new Set();
 
   constructor(command, args, options = {}) {
     this.child = spawn(command, args, {
@@ -69,6 +70,7 @@ export class JsonLinePeer {
     });
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       if (!line.trim()) return;
+      for (const listener of this.#rawListeners) listener(line);
       let message;
       try {
         message = JSON.parse(line);
@@ -90,13 +92,17 @@ export class JsonLinePeer {
       const error = new Error(
         `Agent transport exited (${signal ?? code})${this.stderr ? `: ${this.stderr.trim()}` : ""}`,
       );
+      error.exitCode = code;
+      error.signal = signal;
       for (const pending of this.#pending.values()) pending.reject(error);
       this.#pending.clear();
       this.#emit({ type: "transport.exit", code, signal, error: error.message });
+      for (const listener of this.#failureListeners) listener(error);
     });
     this.child.once("error", (error) => {
       for (const pending of this.#pending.values()) pending.reject(error);
       this.#pending.clear();
+      for (const listener of this.#failureListeners) listener(error);
     });
   }
 
@@ -116,9 +122,27 @@ export class JsonLinePeer {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
+  sendRaw(frame, isBinary = false) {
+    if (isBinary) throw new Error("This Agent native protocol accepts text frames only");
+    const text = Buffer.isBuffer(frame) ? frame.toString("utf8") : String(frame);
+    if (/[\r\n]/.test(text)) throw new Error("Native JSON-line frames must not contain newlines");
+    if (this.child.stdin.destroyed) throw new Error("Agent transport is closed");
+    this.child.stdin.write(`${text}\n`);
+  }
+
   onMessage(listener) {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  onRaw(listener) {
+    this.#rawListeners.add(listener);
+    return () => this.#rawListeners.delete(listener);
+  }
+
+  onFailure(listener) {
+    this.#failureListeners.add(listener);
+    return () => this.#failureListeners.delete(listener);
   }
 
   async close() {
@@ -138,10 +162,21 @@ export class JsonLinePeer {
 
 export class CodexAdapter {
   capabilities = CODEX_CAPABILITIES;
+  native = Object.freeze({
+    transport: "websocket-json",
+    protocol: "codex-app-server-jsonrpc",
+    protocolVersion: null,
+    resumable: true,
+    clientTools: true,
+  });
 
   constructor({ executable = "codex", appServerArgs = ["app-server", "--stdio"] } = {}) {
     this.executable = executable;
     this.appServerArgs = appServerArgs;
+  }
+
+  describe() {
+    return this.description ??= executableDescription(this.executable);
   }
 
   async *run(request) {
@@ -154,7 +189,7 @@ export class CodexAdapter {
     let turnId;
     try {
       await peer.request("initialize", {
-        clientInfo: { name: "all-api", title: "All API", version: "0.2.0" },
+        clientInfo: { name: "all-api", title: "All API", version: "0.3.0" },
         capabilities: { experimentalApi: true },
       });
       peer.notify("initialized", {});
@@ -214,13 +249,17 @@ export class CodexAdapter {
     }
   }
 
-  async openNative({ send }) {
-    const peer = new JsonLinePeer(this.executable, this.appServerArgs);
-    const off = peer.onMessage(send);
+  async openNative({ send, fail = () => {}, workspace }) {
+    const peer = new JsonLinePeer(this.executable, this.appServerArgs, {
+      cwd: workspace?.path,
+    });
+    const offRaw = peer.onRaw((frame) => send(frame, false));
+    const offFailure = peer.onFailure(fail);
     return {
-      receive: async (message) => peer.send(message),
+      receive: async (frame, isBinary) => peer.sendRaw(frame, isBinary),
       close: async () => {
-        off();
+        offRaw();
+        offFailure();
         await peer.close();
       },
     };
@@ -229,10 +268,22 @@ export class CodexAdapter {
 
 export class ClaudeAdapter {
   capabilities = CLAUDE_CAPABILITIES;
+  native = Object.freeze({
+    transport: "websocket-json",
+    protocol: "claude-code-stream-json",
+    protocolVersion: null,
+    resumable: false,
+    clientTools: true,
+  });
 
-  constructor({ executable = "claude", query = claudeQuery } = {}) {
+  constructor({ executable = "claude", query = claudeQuery, nativeArgs } = {}) {
     this.executable = executable;
     this.query = query;
+    this.nativeArgs = nativeArgs;
+  }
+
+  describe() {
+    return this.description ??= executableDescription(this.executable);
   }
 
   async *run(request) {
@@ -290,82 +341,23 @@ export class ClaudeAdapter {
     throw new Error("Claude Agent SDK ended without a result message");
   }
 
-  async openNative({ send, workspace, profile, sessionId }) {
-    const input = eventQueue();
-    const pending = new Map();
+  async openNative({ send, fail = () => {}, workspace, profile }) {
     const overrides = profile.source === "managed"
       ? pick(profile.overrides, CLAUDE_OPTION_FIELDS)
       : {};
-    const controller = new AbortController();
-    const execution = this.query({
-      prompt: input,
-      options: {
-        cwd: workspace.path,
-        pathToClaudeCodeExecutable: this.executable,
-        settingSources: ["user", "project", "local"],
-        ...(sessionId ? { resume: sessionId } : {}),
-        ...overrides,
-        abortController: controller,
-        canUseTool: (toolName, toolInput, options) => nativeDecision({
-          pending,
-          send,
-          id: options.requestId,
-          payload: {
-            type: "permission_request",
-            request_id: options.requestId,
-            tool_name: toolName,
-            input: toolInput,
-            options: withoutSignal(options),
-          },
-          signal: options.signal,
-          fallback: {
-            behavior: "deny",
-            message: "Native permission request was cancelled",
-          },
-        }),
-        onUserDialog: (request, options) => {
-          const id = `dialog_${cryptoRandomId()}`;
-          return nativeDecision({
-            pending,
-            send,
-            id,
-            payload: { type: "user_dialog_request", request_id: id, request },
-            signal: options.signal,
-            fallback: { behavior: "cancelled" },
-          });
-        },
-        supportedDialogKinds: overrides.supportedDialogKinds ?? ["refusal_fallback_prompt"],
-      },
+    const launch = claudeNativeLaunch(overrides);
+    const peer = new JsonLinePeer(this.executable, this.nativeArgs ?? launch.args, {
+      cwd: workspace?.path,
+      env: { ...process.env, ...launch.env, CLAUDE_CODE_ENTRYPOINT: "sdk-ts" },
     });
-    const pump = (async () => {
-      try {
-        for await (const output of execution) send(output);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          send({ type: "transport.error", error: { message: error.message } });
-        }
-      } finally {
-        for (const decision of pending.values()) decision.resolve(decision.fallback);
-        pending.clear();
-      }
-    })();
+    const offRaw = peer.onRaw((frame) => send(frame, false));
+    const offFailure = peer.onFailure(fail);
     return {
-      receive: async (message) => {
-        if (message?.type === "permission_response" || message?.type === "user_dialog_response") {
-          const decision = pending.get(message.request_id);
-          if (!decision) throw new Error(`Unknown native request_id: ${message.request_id}`);
-          pending.delete(message.request_id);
-          decision.resolve(message.result);
-          return;
-        }
-        if (message?.type === "interrupt") return execution.interrupt();
-        if (message?.type === "set_permission_mode") return execution.setPermissionMode(message.mode);
-        if (message?.type === "set_model") return execution.setModel(message.model);
-        input.push(toSdkUserMessage(message));
-      },
+      receive: async (frame, isBinary) => peer.sendRaw(frame, isBinary),
       close: async () => {
-        input.end();
-        await pump;
+        offRaw();
+        offFailure();
+        await peer.close();
       },
     };
   }
@@ -375,6 +367,17 @@ export class ConnectorAdapter {
   constructor(definition) {
     this.definition = definition;
     this.capabilities = definition.capabilities;
+    this.native = definition.native ?? {
+      transport: "websocket-json",
+      protocol: "connector-jsonrpc",
+      protocolVersion: "1",
+      resumable: Boolean(definition.capabilities.continuation),
+      clientTools: definition.capabilities.tools.includes("client"),
+    };
+  }
+
+  async describe() {
+    return { version: this.definition.version ?? null };
   }
 
   async *run(request) {
@@ -387,7 +390,7 @@ export class ConnectorAdapter {
     try {
       await peer.request("initialize", {
         protocolVersion: 1,
-        client: { name: "all-api", version: "0.2.0" },
+        client: { name: "all-api", version: "0.3.0" },
       });
       const started = await peer.request("session/start", {
         model: request.model,
@@ -411,13 +414,18 @@ export class ConnectorAdapter {
     }
   }
 
-  async openNative({ send }) {
-    const peer = new JsonLinePeer(this.definition.command, this.definition.args ?? []);
-    const off = peer.onMessage(send);
+  async openNative({ send, fail = () => {}, workspace }) {
+    const peer = new JsonLinePeer(this.definition.command, this.definition.args ?? [], {
+      cwd: workspace?.path,
+      env: { ...process.env, ...(this.definition.env ?? {}) },
+    });
+    const offRaw = peer.onRaw((frame) => send(frame, false));
+    const offFailure = peer.onFailure(fail);
     return {
-      receive: async (message) => peer.send(message),
+      receive: async (frame, isBinary) => peer.sendRaw(frame, isBinary),
       close: async () => {
-        off();
+        offRaw();
+        offFailure();
         await peer.close();
       },
     };
@@ -600,34 +608,61 @@ function claudeSystemPrompt(configured, requested) {
   };
 }
 
-function toSdkUserMessage(message) {
-  if (message?.type === "user" && message.message) return message;
-  if (typeof message === "string") {
-    return {
-      type: "user",
-      message: { role: "user", content: message },
-      parent_tool_use_id: null,
-    };
+function claudeNativeLaunch(overrides) {
+  const args = [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--input-format", "stream-json",
+    "--permission-prompt-tool", "stdio",
+    "--setting-sources=user,project,local",
+  ];
+  const values = [
+    ["model", "--model"],
+    ["permissionMode", "--permission-mode"],
+    ["maxTurns", "--max-turns"],
+    ["maxBudgetUsd", "--max-budget-usd"],
+    ["effort", "--effort"],
+    ["fallbackModel", "--fallback-model"],
+  ];
+  for (const [field, flag] of values) {
+    if (overrides[field] !== undefined) args.push(flag, String(overrides[field]));
   }
-  throw new Error("Claude native input must be an SDKUserMessage or a supported control message");
+  if (overrides.allowDangerouslySkipPermissions) {
+    args.push("--allow-dangerously-skip-permissions");
+  }
+  if (overrides.allowedTools?.length) args.push("--allowedTools", overrides.allowedTools.join(","));
+  if (overrides.disallowedTools?.length) {
+    args.push("--disallowedTools", overrides.disallowedTools.join(","));
+  }
+  if (overrides.betas?.length) args.push("--betas", overrides.betas.join(","));
+  if (overrides.mcpServers) {
+    args.push("--mcp-config", JSON.stringify({ mcpServers: overrides.mcpServers }));
+  }
+  if (overrides.agents) args.push("--agents", JSON.stringify(overrides.agents));
+  if (typeof overrides.systemPrompt === "string") {
+    args.push("--system-prompt", overrides.systemPrompt);
+  } else if (overrides.systemPrompt?.append) {
+    args.push("--append-system-prompt", overrides.systemPrompt.append);
+  }
+  return { args, env: overrides.env ?? {} };
 }
 
-function nativeDecision({ pending, send, id, payload, signal, fallback }) {
+function executableDescription(command) {
   return new Promise((resolve) => {
-    if (signal?.aborted) return resolve(fallback);
-    const entry = { resolve, fallback };
-    pending.set(id, entry);
-    signal?.addEventListener("abort", () => {
-      if (pending.delete(id)) resolve(fallback);
-    }, { once: true });
-    send(payload);
+    const child = spawn(command, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    child.once("error", () => resolve({ version: null }));
+    child.once("close", (code) => resolve({
+      version: code === 0 ? output.trim() || null : null,
+    }));
+    const timer = setTimeout(() => child.kill("SIGTERM"), 2_000);
+    timer.unref();
+    child.once("close", () => clearTimeout(timer));
   });
-}
-
-function withoutSignal({ signal, ...value }) {
-  return value;
-}
-
-function cryptoRandomId() {
-  return crypto.randomUUID();
 }
