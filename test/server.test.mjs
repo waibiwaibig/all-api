@@ -327,6 +327,50 @@ test("Chat Completions is strict, streams officially shaped chunks, and preserve
   }
 });
 
+test("standard APIs accept and ignore temperature", async () => {
+  const app = await fixture();
+  try {
+    const chat = await request(app, "/v1/chat/completions", {
+      model: "fixture",
+      messages: [{ role: "user", content: "hi" }],
+      temperature: 0.3,
+    });
+    assert.equal(chat.status, 200);
+
+    const response = await request(app, "/v1/responses", {
+      model: "fixture",
+      input: "hi",
+      temperature: 0.3,
+    });
+    assert.equal(response.status, 200);
+
+    const messages = await request(app, "/v1/messages", {
+      model: "fixture",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "hi" }],
+      temperature: 0.3,
+    }, {
+      authorization: "",
+      "x-api-key": app.token,
+      "anthropic-version": "2023-06-01",
+    });
+    assert.equal(messages.status, 200);
+
+    assert.equal(app.runs.length, 3);
+    assert.ok(app.runs.every((run) => run.temperature === undefined));
+
+    const invalid = await request(app, "/v1/chat/completions", {
+      model: "fixture",
+      messages: [{ role: "user", content: "hi" }],
+      temperature: "hot",
+    });
+    assert.equal(invalid.status, 400);
+    assert.match((await invalid.json()).error.message, /temperature.*number/i);
+  } finally {
+    await app.cleanup();
+  }
+});
+
 test("Chat streaming fails explicitly when requested usage is unavailable", async () => {
   const app = await fixture();
   const original = app.registry.get("fixture");

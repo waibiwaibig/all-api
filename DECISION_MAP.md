@@ -63,6 +63,7 @@ flowchart LR
 - Codex managed 结构为 `thread`、`turn` 和可选 Native `args`/`env`。
 - Claude managed 结构为 SDK `options` 和可选 Native `args`/`env`。
 - All API 不维护 Agent 字段白名单；原生参数不支持时由 Agent 明确报错。
+- 三种标准接口接受数值 `temperature`，但不传给没有统一采样温度控制的 Agent。
 - 未知的 All API 外层参数块直接拒绝，不能静默忽略。
 
 Native 帧中的设置优先于模型配置能够提供的启动默认值；All API 不修改帧。

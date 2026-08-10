@@ -65,6 +65,9 @@ Chat Completions 和 Messages 忽略普通 Agent 过程事件，只返回回答�
 返回；可在配置中设置 `server.responsesIncludeProcessEvents: false` 只保留回答。
 能力目录用每个协议的 `agent_process_events` 公开这一差异。Native 始终原样传输。
 
+三种标准接口都接受数值 `temperature` 以兼容普通模型客户端，但 Coding Agent
+没有统一的采样温度控制，因此 All API 会将它视为未设置，不传给 Agent。
+
 Anthropic 必填的 `max_tokens` 会被接收以保持客户端可调用，但 Coding Agent
 没有对应的输出 token 上限；能力目录会明确返回
 `max_tokens_enforced: false`。为保证 `message_start` 中的 usage 准确，

@@ -139,6 +139,7 @@ async function chatCompletions(context, grant) {
   ensureArray(body.messages, "messages");
   optionalBoolean(body.stream, "stream");
   optionalBoolean(body.parallel_tool_calls, "parallel_tool_calls");
+  optionalNumber(body.temperature, "temperature");
   if (body.stream_options !== undefined) {
     strictObject(body.stream_options, ["include_usage"]);
     optionalBoolean(body.stream_options.include_usage, "stream_options.include_usage");
@@ -230,6 +231,7 @@ async function createResponse(context, grant) {
   optionalBoolean(body.stream, "stream");
   optionalBoolean(body.store, "store");
   optionalBoolean(body.parallel_tool_calls, "parallel_tool_calls");
+  optionalNumber(body.temperature, "temperature");
   if (body.metadata !== undefined && (
     body.metadata === null
     || typeof body.metadata !== "object"
@@ -418,6 +420,7 @@ async function messages(context, grant) {
   const body = strictObject(await readJson(request), MESSAGE_FIELDS, ["model", "max_tokens", "messages"]);
   ensureArray(body.messages, "messages");
   optionalBoolean(body.stream, "stream");
+  optionalNumber(body.temperature, "temperature");
   if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1) {
     throw new HttpError(400, "'max_tokens' must be a positive integer", "invalid_request_error", "max_tokens");
   }
@@ -961,15 +964,15 @@ class FileStore {
 
 const CHAT_FIELDS = [
   "model", "messages", "stream", "stream_options", "tools", "tool_choice",
-  "parallel_tool_calls", "metadata", "user",
+  "parallel_tool_calls", "metadata", "user", "temperature",
 ];
 const RESPONSE_FIELDS = [
   "model", "input", "previous_response_id", "stream", "tools", "tool_choice",
-  "parallel_tool_calls", "metadata", "store", "instructions",
+  "parallel_tool_calls", "metadata", "store", "instructions", "temperature",
 ];
 const MESSAGE_FIELDS = [
   "model", "max_tokens", "messages", "system", "stream", "tools", "tool_choice",
-  "metadata", "stop_sequences",
+  "metadata", "stop_sequences", "temperature",
 ];
 
 function openAiModels({ config, registry }, grant) {
@@ -1322,6 +1325,12 @@ function rejectUnsupported(body, fields) {
 function optionalBoolean(value, field) {
   if (value !== undefined && typeof value !== "boolean") {
     throw new HttpError(400, `'${field}' must be a boolean`, "invalid_request_error", field);
+  }
+}
+
+function optionalNumber(value, field) {
+  if (value !== undefined && value !== null && !Number.isFinite(value)) {
+    throw new HttpError(400, `'${field}' must be a number`, "invalid_request_error", field);
   }
 }
 
