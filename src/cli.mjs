@@ -44,7 +44,7 @@ export async function main(argv) {
     try {
       const connection = await managementCall('secretary.init', {
         model: required(options.model, '--model'), workspace: required(options.workspace, '--workspace'),
-        url: required(options.url, '--url'), name: options.name ?? '秘书',
+        url: options.url, name: options.name ?? '秘书',
       });
       await file.writeFile(JSON.stringify(connection, null, 2) + '\n');
       await file.sync();
@@ -439,7 +439,7 @@ Agents and exposure:
   all-api expose direct on|off
 
 Public protocols:
-  secretary init --model <id> --workspace <id> --url <origin> --output <private.json>
+  secretary init --model <id> --workspace <id> [--url <origin>] --output <private.json>
 
   POST /v1/chat/completions   POST /v1/responses
   POST /v1/messages           GET/POST /v1/files

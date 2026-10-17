@@ -69,7 +69,14 @@ export async function createAdminServer({
       const created = await createApiKey({ kind: 'access', name: 'Secretary connection', models: [params.model], workspaces: [params.workspace], defaultWorkspace: params.workspace });
       const next = structuredClone(config);
       next.keys[created.record.id] = created.record;
-      next.secretary = { id: randomUUID(), name: params.name ?? '秘书', model: params.model, workspace: params.workspace, keyId: created.record.id, url: params.url.replace(/\/$/, '') };
+      next.secretary = {
+        id: randomUUID(),
+        name: params.name ?? '秘书',
+        model: params.model,
+        workspace: params.workspace,
+        keyId: created.record.id,
+        url: (params.url ?? `http://127.0.0.1:${config.server.port}`).replace(/\/$/, ''),
+      };
       await persist(next);
       return { version: 1, protocol: 'a2a/1.0', id: next.secretary.id, name: next.secretary.name, agentCardUrl: next.secretary.url + '/.well-known/agent-card.json', token: created.token };
     }

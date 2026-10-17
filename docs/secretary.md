@@ -4,15 +4,15 @@ All API 增加可选的秘书服务，与原有协议桥接层分开。标准模
 
 ## 初始化
 
-需要 Node.js 22.18 或更新版本。先启动已配置的 All API，再由本机管理接口建立秘书：
+需要 Node.js 22.18 或更新版本。默认在 Knock 主机所在机器运行 All API 和连接程序；WSL 部署就在 WSL 内执行以下步骤。先启动该机器已配置的 All API，再由本机管理接口建立秘书：
 
 ```sh
 all-api secretary init --model codex --workspace default \
-  --url http://127.0.0.1:8787 --name 秘书 \
+  --name 秘书 \
   --output /private/secretary.json
 ```
 
-命令创建专用 Access Key，限定所选模型与工作区，写出仅属主可读写的连接文件。stdout 只返回文件位置。已有文件和已有秘书配置会被拒绝覆盖。`--url` 是连接程序可访问的 All API origin；同机使用回环 HTTP，跨机器使用已有 HTTPS 部署。
+命令创建专用 Access Key，限定所选模型与工作区，写出仅属主可读写的连接文件。stdout 只返回文件位置。已有文件和已有秘书配置会被拒绝覆盖。省略 `--url` 时，地址由该实例的监听端口生成，使用 `http://127.0.0.1:<port>`。只有明确选择外部秘书服务时才传入 HTTPS origin。执行安装的电脑不改变默认部署位置。
 
 连接文件包含 `version: 1`、`protocol: "a2a/1.0"`、固定 `id`、显示名 `name`、`agentCardUrl` 和私密 `token`。不要把它加入 Git 或聊天记录。模型、权限和工作目录留在 All API 主机配置中。
 

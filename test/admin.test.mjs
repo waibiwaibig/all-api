@@ -29,6 +29,32 @@ function config(workspace) {
   };
 }
 
+test("secretary defaults to this deployment's loopback API and scopes its credential", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "all-api-local-secretary-"));
+  let current = config(directory);
+  current.server.port = 9189;
+  const endpoint = adminEndpoint(directory);
+  const server = await createAdminServer({
+    endpoint,
+    getConfig: () => current,
+    async saveConfig(next) { current = next; },
+  });
+  try {
+    const connection = await adminRequest(endpoint, "secretary.init", {
+      model: "codex", workspace: "demo",
+    });
+    assert.equal(connection.agentCardUrl, "http://127.0.0.1:9189/.well-known/agent-card.json");
+    assert.deepEqual(current.keys[current.secretary.keyId].models, ["codex"]);
+    assert.deepEqual(current.keys[current.secretary.keyId].workspaces, ["demo"]);
+    await assert.rejects(() => adminRequest(endpoint, "secretary.init", {
+      model: "codex", workspace: "demo",
+    }), /already configured/i);
+  } finally {
+    await server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("management RPC is local-only and mutates profiles, workspaces, and keys separately", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-admin-"));
   const store = new ConfigStore(path.join(directory, "config.json"));

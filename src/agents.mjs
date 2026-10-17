@@ -237,7 +237,7 @@ export class CodexAdapter {
     let usage;
     try {
       await peer.request("initialize", {
-        clientInfo: { name: "all-api", title: "All API", version: "0.5.0" },
+        clientInfo: { name: "all-api", title: "All API", version: "0.5.1" },
         capabilities: { experimentalApi: true },
       });
       peer.notify("initialized", {});
@@ -492,7 +492,7 @@ export class ConnectorAdapter {
     try {
       await peer.request("initialize", {
         protocolVersion: 1,
-        client: { name: "all-api", version: "0.5.0" },
+        client: { name: "all-api", version: "0.5.1" },
       });
       const started = await peer.request("session/start", {
         model: request.model,
