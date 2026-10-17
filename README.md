@@ -34,7 +34,7 @@ all-api up
 
 `init` 会检测本机 Agent，登记工作目录，并输出只显示一次的 Access Key。
 服务默认只监听 `127.0.0.1:8787`。配置和 Key 哈希保存在 `~/.all-api`；
-可用 `ALL_API_HOME` 改变该目录。0.4 使用配置版本 4，刻意不迁移旧配置。
+可用 `ALL_API_HOME` 改变该目录。当前使用配置版本 4，刻意不迁移旧配置。
 
 ```sh
 all-api status

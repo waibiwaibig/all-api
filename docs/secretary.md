@@ -56,3 +56,13 @@ Knock 的电脑连接程序加载上述 JSON，以 A2A 提交并轮询 Task，�
 [A2A JavaScript SDK README](https://github.com/a2aproject/a2a-js#capability-overview) 的 Servers、Clients、Custom event bus and task store 小节提供协议处理器和持久化扩展点。[Codex App Server](https://learn.chatgpt.com/docs/app-server) 的线程生命周期、`thread/resume`、`turn/start` 和 `turn/completed` 部分对应后端会话管理与成功判定。
 
 `test/secretary.test.mjs` 使用官方 A2A 客户端验证重发幂等、内容冲突、重启续接、串行队列、排队取消、密钥隔离与崩溃后的不重放行为。Mock 检查不代表真实 Agent 版本认证；实际 Codex/Claude 验收需分别记录。
+
+## 2026-10-17 本地与部署验收
+
+- All API 0.5.0：语法检查通过，自动测试 57 项通过、3 项真实 Agent 测试默认跳过；测试不代替真实认证。
+- macOS 上使用 Codex 0.162.0-alpha.17.2 实际运行两轮 A2A 请求，第二轮在同一公开 contextId 恢复首轮校验词。随后安装发布 tarball，并以 launchd 常驻运行；服务重启后原 Task 仍保存在 SQLite 中。
+- Knock 0.3.0 使用独立 receiver 和状态目录连接该 API；它通过公开 JSON 文件和 A2A 协议接入，没有导入 All API 实现。
+- Claude 的秘书连续对话尚未进行真实登录环境验收。长期记忆检索、跨项目并行工作与长时间离线恢复，需要独立使用评估。
+
+- 真机两轮自动收发通过：手机发送“记住检验词：松果 829”，秘书回复“已记住：松果 829”；后续询问得到“松果 829”。两轮任务完成、回复由主机存储且 APNs 各一次接受；用户确认两次均收到且内容正确。底层继续使用先前 API 测试的同一上下文，跨服务重启后续接成功。
+- 已移除试验用 Codex Stop 自动通知钩子及其独立会话接收服务，撤销其 receiver；历史记录保留。普通 Knock 通知发送服务和新的秘书连接服务分别运行。
