@@ -61,3 +61,12 @@ test("managed exposure only records a live process and refuses to orphan another
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('autostart launcher preserves isolated home and execution PATH without copying unrelated secrets', async () => {
+  const { autostartLauncher } = await import('../src/platform.mjs');
+  const source = autostartLauncher('/tmp/my secretary', '/tmp/all api/src/cli.mjs', { PATH: '/tools:/usr/bin', HTTPS_PROXY: 'http://127.0.0.1:7897', PRIVATE_TOKEN: 'never-copy' });
+  assert.ok(source.includes('"ALL_API_HOME":"/tmp/my secretary"'));
+  assert.ok(source.includes('"PATH":"/tools:/usr/bin"'));
+  assert.ok(source.includes('all%20api/src/cli.mjs'));
+  assert.ok(!source.includes('never-copy'));
+});

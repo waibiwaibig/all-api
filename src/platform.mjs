@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -209,6 +211,12 @@ export async function restoreExposure({ dataDirectory, localPort }) {
 }
 
 export async function setAutostart({ enabled, dataDirectory, cliPath }) {
+  const launcher = path.join(dataDirectory, 'autostart.mjs');
+  if (enabled) {
+    await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(launcher, autostartLauncher(dataDirectory, cliPath), { mode: 0o600 });
+  }
+  cliPath = launcher;
   if (process.platform === "darwin") {
     return macAutostart(enabled, dataDirectory, cliPath);
   }
@@ -354,7 +362,7 @@ function isProcessRunning(pid) {
 }
 
 async function macAutostart(enabled, dataDirectory, cliPath) {
-  const label = "dev.all-api.server";
+  const label = `dev.all-api.server.${serviceId(dataDirectory)}`;
   const launchAgents = path.join(homedir(), "Library", "LaunchAgents");
   const plist = path.join(launchAgents, `${label}.plist`);
   const domain = `gui/${process.getuid()}`;
@@ -384,9 +392,10 @@ async function macAutostart(enabled, dataDirectory, cliPath) {
 
 async function linuxAutostart(enabled, dataDirectory, cliPath) {
   const directory = path.join(homedir(), ".config", "systemd", "user");
-  const unit = path.join(directory, "all-api.service");
+  const unitName = `all-api-${serviceId(dataDirectory)}.service`;
+  const unit = path.join(directory, unitName);
   if (!enabled) {
-    await runCommand("systemctl", ["--user", "disable", "--now", "all-api.service"]);
+    await runCommand("systemctl", ["--user", "disable", "--now", unitName]);
     await rm(unit, { force: true });
     await runCommand("systemctl", ["--user", "daemon-reload"]);
     return { enabled: false, provider: "systemd-user" };
@@ -405,12 +414,12 @@ WorkingDirectory=${systemdEscape(dataDirectory)}
 WantedBy=default.target
 `, { mode: 0o600 });
   await runChecked("systemctl", ["--user", "daemon-reload"]);
-  await runChecked("systemctl", ["--user", "enable", "--now", "all-api.service"]);
+  await runChecked("systemctl", ["--user", "enable", "--now", unitName]);
   return { enabled: true, provider: "systemd-user", file: unit };
 }
 
 async function windowsAutostart(enabled, dataDirectory, cliPath) {
-  const name = "All API";
+  const name = `All API ${serviceId(dataDirectory)}`;
   if (!enabled) {
     await runCommand("schtasks.exe", ["/Delete", "/TN", name, "/F"]);
     return { enabled: false, provider: "task-scheduler" };
@@ -436,4 +445,11 @@ function xml(value) {
 
 function systemdEscape(value) {
   return value.replaceAll("\\", "\\\\").replaceAll(" ", "\\x20");
+}
+
+function serviceId(directory) { return createHash('sha256').update(directory).digest('hex').slice(0, 12); }
+export function autostartLauncher(directory, cliPath, environment = process.env) {
+  const env = { ALL_API_HOME: directory };
+  for (const name of ['PATH', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY']) if (environment[name]) env[name] = environment[name];
+  return `Object.assign(process.env, ${JSON.stringify(env)});\nconst { main } = await import(${JSON.stringify(pathToFileURL(cliPath).href)});\nawait main(['serve']);\n`;
 }

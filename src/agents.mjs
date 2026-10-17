@@ -5,7 +5,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { query as claudeQuery } from "@anthropic-ai/claude-agent-sdk";
 
-const CERTIFIED_CODEX_VERSION = "0.144.1";
+const CERTIFIED_CODEX_VERSION = "0.162.0-alpha.17.2";
 const CERTIFIED_CLAUDE_VERSIONS = new Set(["2.1.119"]);
 const CERTIFIED_CLAUDE_SDK_VERSION = "0.3.220";
 
@@ -237,7 +237,7 @@ export class CodexAdapter {
     let usage;
     try {
       await peer.request("initialize", {
-        clientInfo: { name: "all-api", title: "All API", version: "0.4.0" },
+        clientInfo: { name: "all-api", title: "All API", version: "0.5.0" },
         capabilities: { experimentalApi: true },
       });
       peer.notify("initialized", {});
@@ -260,6 +260,7 @@ export class CodexAdapter {
             ...threadOverrides,
           });
       threadId = thread.thread.id;
+      request.onSession?.(threadId);
       const turn = await peer.request("turn/start", {
         threadId,
         input: toCodexInput(request.input),
@@ -380,8 +381,13 @@ export class ClaudeAdapter {
       },
     });
     let sessionId = request.sessionId;
+    let announcedSession;
     for await (const message of execution) {
       sessionId = message.session_id ?? sessionId;
+      if (sessionId && sessionId !== announcedSession) {
+        announcedSession = sessionId;
+        request.onSession?.(sessionId);
+      }
       const messageUsage = message.message?.usage ?? message.usage;
       if (Number.isFinite(messageUsage?.input_tokens)
         && Number.isFinite(messageUsage?.output_tokens)) {
@@ -486,7 +492,7 @@ export class ConnectorAdapter {
     try {
       await peer.request("initialize", {
         protocolVersion: 1,
-        client: { name: "all-api", version: "0.4.0" },
+        client: { name: "all-api", version: "0.5.0" },
       });
       const started = await peer.request("session/start", {
         model: request.model,
@@ -531,8 +537,8 @@ export class ConnectorAdapter {
 
 export function createDefaultRegistry(config) {
   const registry = new AgentRegistry()
-    .register("codex", new CodexAdapter())
-    .register("claude", new ClaudeAdapter());
+    .register("codex", new CodexAdapter({ executable: config.executables?.codex }))
+    .register("claude", new ClaudeAdapter({ executable: config.executables?.claude }));
   for (const [name, definition] of Object.entries(config.connectors)) {
     registry.register(name, new ConnectorAdapter(definition));
   }
@@ -814,7 +820,7 @@ function standardCompatibility(result) {
 }
 
 function semanticVersion(value) {
-  return /\b(\d+\.\d+\.\d+)\b/.exec(value ?? "")?.[1] ?? null;
+  return /\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(value ?? "")?.[1] ?? null;
 }
 
 function runProcess(command, args, timeoutMs) {

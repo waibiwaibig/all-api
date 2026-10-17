@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import crypto from "node:crypto";
 import { createConnection, createServer } from "node:net";
 import { chmod, rm } from "node:fs/promises";
@@ -53,7 +54,26 @@ export async function createAdminServer({
     const params = request.params ?? {};
     const config = getConfig();
     if (request.method === "catalog") return managementCatalog(config);
+    if (request.method === 'agent.executable') {
+      if (!['codex', 'claude'].includes(params.name) || !path.isAbsolute(params.path ?? '')) throw new Error('Require a built-in agent and absolute executable path');
+      const next = structuredClone(config);
+      next.executables = { ...next.executables, [params.name]: params.path };
+      await persist(next);
+      return { agent: params.name, executable: params.path, restartRequired: true };
+    }
     if (request.method === "key.list") return publicKeys(config);
+    if (request.method === 'secretary.init') {
+      if (config.secretary) throw new Error('Secretary already configured; preserve its identity and connection file');
+      requireEntry(config.models, params.model, 'model');
+      requireEntry(config.workspaces, params.workspace, 'workspace');
+      const created = await createApiKey({ kind: 'access', name: 'Secretary connection', models: [params.model], workspaces: [params.workspace], defaultWorkspace: params.workspace });
+      const next = structuredClone(config);
+      next.keys[created.record.id] = created.record;
+      next.secretary = { id: randomUUID(), name: params.name ?? '秘书', model: params.model, workspace: params.workspace, keyId: created.record.id, url: params.url.replace(/\/$/, '') };
+      await persist(next);
+      return { version: 1, protocol: 'a2a/1.0', id: next.secretary.id, name: next.secretary.name, agentCardUrl: next.secretary.url + '/.well-known/agent-card.json', token: created.token };
+    }
+
     if (request.method === "key.create") {
       const kind = params.kind ?? "access";
       if (kind === "access") {

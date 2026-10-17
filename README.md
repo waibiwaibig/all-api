@@ -17,11 +17,13 @@ flowchart LR
     R --> P["外部 Agent 连接器"]
 ```
 
+可选的[持久秘书服务](docs/secretary.md)提供一个长期入口，通过 A2A 1.0 对接 Knock 等客户端；模型和底层会话留在主机管理。
+
 完整产品决策和更多架构图见 [DECISION_MAP.md](./DECISION_MAP.md)。
 
 ## 安装与启动
 
-要求 Node.js 20 或更新版本。Codex、Claude 可以预先安装，也可以稍后由
+要求 Node.js 22.18 或更新版本。Codex、Claude 可以预先安装，也可以稍后由
 All API 调用官方安装渠道安装。
 
 ```sh
@@ -156,6 +158,8 @@ WebSocket 会立即关闭。它不能调用标准执行、文件或管理接口�
 
 ```sh
 all-api agent detect
+# 多份安装并存时，可固定实际执行程序；修改后重启服务
+all-api agent executable codex --path /absolute/path/to/codex
 all-api agent install codex
 all-api agent install claude
 all-api agent update codex
@@ -211,7 +215,7 @@ Cloudflare/SSH 只有在子进程稳定启动后才记录成功；重复启动�
 
 - Chat Completions 和 Messages 是无状态转换；Responses 用不透明映射续接
   Agent 会话；Native 直接使用 Agent 会话。
-- Agent 是对话历史的唯一事实来源。为实现 Responses 原生查询，All API 保存
+- 在标准协议桥接层，Agent 是执行对话历史的事实来源。为实现 Responses 原生查询，All API 保存
   自己已经返回的最终标准 Response（output、usage、状态）和 Agent 会话映射，
   不保存输入、原始 Agent 帧或 Agent 对话副本。启用 Responses 过程事件时，其
   文字投影属于最终标准 output，也会随 Response 保存。默认保留30天。
@@ -227,7 +231,8 @@ Cloudflare/SSH 只有在子进程稳定启动后才记录成功；重复启动�
 - usage 只在 Agent 返回真实数据时出现，不估算、不填零。
 - 标准 API 达到并发上限时立即返回 busy；Native 只限制连接数、单帧大小和
   待发送字节，不解析回合，也不建立 All API 自己的排队系统。
-- 默认不记录请求正文；仅在主动设置 `ALL_API_DEBUG=1` 时输出详细内部错误。
+- 秘书服务显式保存用户消息和任务结果，以支持排队、幂等与重启恢复，详见其独立文档。
+- 标准桥接默认不记录请求正文；仅在主动设置 `ALL_API_DEBUG=1` 时输出详细内部错误。
 
 ## 开发
 

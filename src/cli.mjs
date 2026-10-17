@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,19 @@ export async function main(argv) {
   const [command = "help", subject, action] = positional;
   if (command === "help" || options.help) return printHelp();
   if (command === "init") return initialize(options);
+  if (command === "secretary" && subject === "init") {
+    const filename = path.resolve(required(options.output, '--output'));
+    const file = await open(filename, 'wx', 0o600);
+    try {
+      const connection = await managementCall('secretary.init', {
+        model: required(options.model, '--model'), workspace: required(options.workspace, '--workspace'),
+        url: required(options.url, '--url'), name: options.name ?? '秘书',
+      });
+      await file.writeFile(JSON.stringify(connection, null, 2) + '\n');
+      await file.sync();
+      return output({ configured: true, connectionFile: filename });
+    } finally { await file.close(); }
+  }
   if (command === "serve") return serve();
   if (command === "up") return startBackground();
   if (command === "down") return output(await managementCall("server.shutdown"));
@@ -116,6 +129,7 @@ export async function main(argv) {
       id: required(positional[2], "connector id"),
     }));
   }
+  if (command === 'agent' && subject === 'executable') return output(await managementCall('agent.executable', { name: required(positional[2], 'agent name'), path: path.resolve(required(options.path, '--path')) }));
   if (command === "agent" && subject === "detect") return output(await detectAgents());
   if (command === "agent" && subject === "install") {
     return output(await installAgent(required(positional[2], "agent name")));
@@ -425,6 +439,8 @@ Agents and exposure:
   all-api expose direct on|off
 
 Public protocols:
+  secretary init --model <id> --workspace <id> --url <origin> --output <private.json>
+
   POST /v1/chat/completions   POST /v1/responses
   POST /v1/messages           GET/POST /v1/files
   WS   /v1/native/sessions    GET /allapi/v1/catalog

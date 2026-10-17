@@ -1,10 +1,10 @@
-# All API v0.4 决策图
+# All API 决策图
 
-状态：已确认并作为实现与验收依据。配置版本为4，不迁移旧配置。
+状态：桥接层沿用配置版本4；可选秘书服务的决策和验收见 [持久秘书服务](docs/secretary.md)。不迁移旧配置。
 
 核心原则：
 
-> All API 与 Agent 在同一台机器上。Native 只转发；标准接口只做经过验证的格式组装。配置、权限、工具执行和会话仍属于 Agent。
+> 协议桥接层与 Agent 在同一台机器上。Native 只转发；标准接口只做经过验证的格式组装。配置、权限、工具执行和会话仍属于 Agent。
 
 ## 1. 产品边界
 
@@ -182,7 +182,7 @@ Agent × Agent/SDK 版本 × 标准接口 × 输入、流式、续接、usage �
 - 未认证版本在能力目录标记 `unverified`，标准执行返回明确错误。
 - All API 发布认证使用官方 OpenAI SDK、官方 Anthropic SDK和真实 Agent。
 - Mock fixture 只用于快速回归，不能单独证明兼容。
-- 当前认证目标：Codex 0.144.1、Claude Code 2.1.119、
+- 当前认证目标：Codex 0.162.0-alpha.17.2、Claude Code 2.1.119、
   Claude Agent SDK 0.3.220。
 - 认证状态逐标准接口记录；一个接口通过不能自动开放另外两个接口。
 
@@ -206,6 +206,6 @@ Agent × Agent/SDK 版本 × 标准接口 × 输入、流式、续接、usage �
 8. 文件不做有损降级，URL 不建立虚假安全边界。
 9. Access/Native/本机管理权限严格分离。
 10. 未认证 Agent 版本只开放 Native，能力目录公开原因。
-11. 默认存储不复制输入、原始 Agent 帧或完整会话；Responses 过程事件的文字
+11. 标准桥接的默认存储不复制输入、原始 Agent 帧或完整会话；Responses 过程事件的文字
     投影属于最终标准 output，并按配置过期。
 12. 语法检查、离线回归和真实 Agent 认证全部通过。

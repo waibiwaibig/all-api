@@ -163,6 +163,15 @@ export function validateConfig(config) {
       throw new Error(`key "${id}" defaultWorkspace must be one of its workspace grants`);
     }
   }
+  if (config.executables !== undefined && (!isRecord(config.executables) || Object.entries(config.executables).some(([name, executable]) => !['codex', 'claude'].includes(name) || !path.isAbsolute(executable)))) throw new Error('Agent executables must be absolute codex/claude paths');
+  if (config.secretary !== undefined) {
+    const s = config.secretary;
+    if (!isRecord(s) || !/^[\w-]{36}$/.test(s.id ?? '') || typeof s.name !== 'string' || !s.name.trim() || s.name.length > 60
+      || !config.models[s.model] || !config.workspaces[s.workspace] || typeof s.keyId !== 'string') throw new Error('Invalid secretary configuration');
+    const u = new URL(s.url);
+    if (u.username || u.password || u.search || u.hash || u.pathname !== '/' ||
+      !(u.protocol === 'https:' || (u.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(u.hostname)))) throw new Error('Secretary URL requires HTTPS or loopback HTTP');
+  }
   return config;
 }
 
