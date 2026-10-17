@@ -16,6 +16,8 @@ all-api secretary init --model codex --workspace default \
 
 连接文件包含 `version: 1`、`protocol: "a2a/1.0"`、固定 `id`、显示名 `name`、`agentCardUrl` 和私密 `token`。不要把它加入 Git 或聊天记录。模型、权限和工作目录留在 All API 主机配置中。
 
+WSL 2 NAT 部署需要使用 Windows 上已有的 HTTP 代理时，可执行 `all-api autostart on --wsl-proxy-port 7890`，然后重启对应 user systemd 服务。端口必须取自实际代理配置，代理需要允许 WSL 访问。启动器每次启动都从系统路由解析 Windows 主机地址，避免 WSL 重启后地址变化；本机回环通信不走代理。设置保存在该实例的 `autostart.json`，后续启用自启动时保留；传入 `--wsl-proxy-port off` 可移除。它只设置 All API 进程环境，不更改 Windows 系统代理或其他服务。
+
 秘书密钥只能读取自己所属的 Agent Card 和任务。其他普通 Access Key 或 Native Key 无权访问秘书接口。删除专用密钥会停止接受新请求；已经开始的外部操作需要独立检查。
 
 ## 协议
@@ -66,3 +68,10 @@ Knock 的电脑连接程序加载上述 JSON，以 A2A 提交并轮询 Task，�
 
 - 真机两轮自动收发通过：手机发送“记住检验词：松果 829”，秘书回复“已记住：松果 829”；后续询问得到“松果 829”。两轮任务完成、回复由主机存储且 APNs 各一次接受；用户确认两次均收到且内容正确。底层继续使用先前 API 测试的同一上下文，跨服务重启后续接成功。
 - 已移除试验用 Codex Stop 自动通知钩子及其独立会话接收服务，撤销其 receiver；历史记录保留。普通 Knock 通知发送服务和新的秘书连接服务分别运行。
+
+### 同日切换为 WSL 部署主机
+
+- 按部署位置规则，将秘书执行、状态和 Knock 连接程序移到私人 Knock 主机所在的 WSL；Mac 的秘书服务已停用。All API 仅监听 WSL 本机 `127.0.0.1:8789`，连接程序通过本机 A2A 访问。
+- 保留公开秘书身份、任务记录和原生会话历史；恢复会话时显式使用 WSL 当前模型配置。真实 A2A 请求成功返回手机此前给出的“松果 829”，上下文连续性验证通过。
+- WSL 原生 Codex 需要 Windows 现有代理。已验证端口 7890，并为 All API 自启动配置动态解析 WSL NAT 默认路由；服务重启后真实请求通过。All API、Knock 连接程序和私人主机均为 active、enabled。
+- 本次版本检查：语法检查通过，61 项测试通过、3 项真实 Agent 测试跳过。WSL 真实调用结果单独验证，手机重新收发另行记录。

@@ -142,6 +142,8 @@ export async function main(argv) {
       enabled: subject === "on",
       dataDirectory,
       cliPath,
+      wslProxyPort: options['wsl-proxy-port'] === undefined ? undefined
+        : options['wsl-proxy-port'] === 'off' ? null : numberOption(options['wsl-proxy-port']),
     }));
   }
   if (command === "expose") return expose(subject, action, options);
@@ -228,10 +230,11 @@ async function serve() {
       if (active.standard || active.native) throw new Error("Stop active Agent sessions before updating");
       return updateAgent(name);
     },
-    "autostart.set": ({ enabled }) => setAutostart({
+    "autostart.set": ({ enabled, wslProxyPort }) => setAutostart({
       enabled: Boolean(enabled),
       dataDirectory,
       cliPath,
+      wslProxyPort,
     }),
     "exposure.cloudflare.configure": (params, current) => configureCloudflare({
       dataDirectory,
@@ -352,8 +355,8 @@ async function managementCall(method, params, options) {
     "agent.detect": () => detectAgents(),
     "agent.install": ({ name }) => installAgent(name),
     "agent.update": ({ name }) => updateAgent(name),
-    "autostart.set": ({ enabled }) => setAutostart({
-      enabled: Boolean(enabled), dataDirectory, cliPath,
+    "autostart.set": ({ enabled, wslProxyPort }) => setAutostart({
+      enabled: Boolean(enabled), dataDirectory, cliPath, wslProxyPort,
     }),
     "exposure.cloudflare.configure": (value, current) => configureCloudflare({
       dataDirectory,
@@ -418,7 +421,7 @@ function printHelp() {
 Setup and service:
   all-api init [--workspace PATH] [--port 8787]
   all-api up | serve | status | down
-  all-api autostart on|off
+  all-api autostart on|off [--wsl-proxy-port PORT|off]
 
 Configuration (local management socket only):
   all-api models | model put ID --agent NAME --workspace ID

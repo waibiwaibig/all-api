@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
+import { isIP } from "node:net";
 import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
@@ -210,11 +211,24 @@ export async function restoreExposure({ dataDirectory, localPort }) {
   };
 }
 
-export async function setAutostart({ enabled, dataDirectory, cliPath }) {
+export async function setAutostart({ enabled, dataDirectory, cliPath, wslProxyPort }) {
   const launcher = path.join(dataDirectory, 'autostart.mjs');
   if (enabled) {
     await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-    await writeFile(launcher, autostartLauncher(dataDirectory, cliPath), { mode: 0o600 });
+    const settingsPath = path.join(dataDirectory, 'autostart.json');
+    let settings = {};
+    try { settings = JSON.parse(await readFile(settingsPath, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (wslProxyPort !== undefined) {
+      if (wslProxyPort === null) delete settings.wslProxyPort;
+      else {
+        validateProxyPort(wslProxyPort);
+        if (process.platform !== 'linux' || !/microsoft/i.test(await readFile('/proc/sys/kernel/osrelease', 'utf8'))) throw new Error('Windows host proxy requires WSL');
+        settings.wslProxyPort = wslProxyPort;
+      }
+    }
+    await writeFile(settingsPath, JSON.stringify(settings) + '\n', { mode: 0o600 });
+    await writeFile(launcher, autostartLauncher(dataDirectory, cliPath, process.env, settings), { mode: 0o600 });
   }
   cliPath = launcher;
   if (process.platform === "darwin") {
@@ -408,6 +422,7 @@ After=network.target
 [Service]
 ExecStart=${systemdEscape(process.execPath)} ${systemdEscape(cliPath)} serve
 Restart=on-failure
+RestartSec=10
 WorkingDirectory=${systemdEscape(dataDirectory)}
 
 [Install]
@@ -448,8 +463,22 @@ function systemdEscape(value) {
 }
 
 function serviceId(directory) { return createHash('sha256').update(directory).digest('hex').slice(0, 12); }
-export function autostartLauncher(directory, cliPath, environment = process.env) {
+export function autostartLauncher(directory, cliPath, environment = process.env, settings = {}) {
   const env = { ALL_API_HOME: directory };
   for (const name of ['PATH', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY']) if (environment[name]) env[name] = environment[name];
-  return `Object.assign(process.env, ${JSON.stringify(env)});\nconst { main } = await import(${JSON.stringify(pathToFileURL(cliPath).href)});\nawait main(['serve']);\n`;
+  const proxy = settings.wslProxyPort === undefined ? '' : `const { windowsHostProxy } = await import(${JSON.stringify(new URL('./platform.mjs', pathToFileURL(cliPath)).href)});\nObject.assign(process.env, windowsHostProxy(${JSON.stringify(settings.wslProxyPort)}));\n`;
+  return `Object.assign(process.env, ${JSON.stringify(env)});\n${proxy}const { main } = await import(${JSON.stringify(pathToFileURL(cliPath).href)});\nawait main(['serve']);\n`;
+}
+
+function validateProxyPort(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Proxy port must be between 1 and 65535');
+}
+
+export function windowsHostProxy(port, routes) {
+  validateProxyPort(port);
+  routes ??= JSON.parse(execFileSync('ip', ['-4', '-j', 'route', 'show', 'default'], { encoding: 'utf8', timeout: 5000 }));
+  const gateway = routes.find(route => route.dst === 'default' && isIP(route.gateway ?? '') === 4)?.gateway;
+  if (!gateway) throw new Error('Cannot resolve the Windows host from the WSL default route');
+  const proxy = `http://${gateway}:${port}`;
+  return { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, ALL_PROXY: proxy, NO_PROXY: 'localhost,127.0.0.1,::1' };
 }

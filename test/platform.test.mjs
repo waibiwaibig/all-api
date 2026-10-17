@@ -70,3 +70,17 @@ test('autostart launcher preserves isolated home and execution PATH without copy
   assert.ok(source.includes('all%20api/src/cli.mjs'));
   assert.ok(!source.includes('never-copy'));
 });
+
+test('WSL proxy resolves the current gateway on each start and keeps loopback local', async () => {
+  const { windowsHostProxy, autostartLauncher } = await import('../src/platform.mjs');
+  const first = windowsHostProxy(7890, [{ dst: 'default', gateway: '172.27.32.1' }]);
+  const afterRestart = windowsHostProxy(7890, [{ dst: 'default', gateway: '172.29.64.1' }]);
+  assert.equal(first.HTTPS_PROXY, 'http://172.27.32.1:7890');
+  assert.equal(afterRestart.HTTPS_PROXY, 'http://172.29.64.1:7890');
+  assert.match(first.NO_PROXY, /127\.0\.0\.1/);
+  assert.throws(() => windowsHostProxy(7890, []), /Cannot resolve/);
+  assert.throws(() => windowsHostProxy(0, []), /port/);
+  const launcher = autostartLauncher('/data', '/app/src/cli.mjs', {}, { wslProxyPort: 7890 });
+  assert.ok(launcher.includes('windowsHostProxy(7890)'));
+  assert.ok(!launcher.includes('172.27.32.1'));
+});
