@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -68,3 +68,17 @@ async function waitUntilStopped(port) {
   }
   assert.fail("All API server did not stop");
 }
+
+
+test("installed CLI runs through the package-manager symlink", { skip: process.platform === "win32" }, async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "all-api-cli-link-"));
+  try {
+    const entry = path.join(directory, "all-api");
+    await symlink(cli, entry);
+    const { stdout } = await execute(process.execPath, [entry, "help"]);
+    assert.match(stdout, /Setup and service:/);
+    assert.match(stdout, /secretary init/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

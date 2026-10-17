@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, openSync, realpathSync } from "node:fs";
 import { access, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -26,7 +26,7 @@ const configPath = path.join(dataDirectory, "config.json");
 const endpoint = adminEndpoint(dataDirectory);
 const store = new ConfigStore(configPath);
 
-if (process.argv[1] && path.resolve(process.argv[1]) === cliPath) {
+if (process.argv[1] && realpathSync(process.argv[1]) === cliPath) {
   main(process.argv.slice(2)).catch((error) => {
     console.error(`all-api: ${error.message}`);
     process.exitCode = 1;
