@@ -58,6 +58,22 @@ test("Codex native transport passes app-server JSON-RPC frames without an All AP
   await native.close();
 });
 
+test("resumed local Codex sessions use this host's model and provider while retaining thread identity", async () => {
+  const adapter = new CodexAdapter({ executable: process.execPath, appServerArgs: [fakeCodex, "--echo-params"] });
+  let output = "", completed;
+  for await (const event of adapter.run({
+    model: "codex", profile, workspace, sessionId: "existing-session",
+    input: [{ type: "text", text: "continue" }], tools: [],
+    signal: new AbortController().signal,
+  })) {
+    if (event.type === "text.delta") output += event.delta;
+    if (event.type === "completed") completed = event;
+  }
+  assert.match(output, /"model":"deployment-model"/);
+  assert.match(output, /"modelProvider":"deployment-provider"/);
+  assert.equal(completed.sessionId, "existing-session");
+});
+
 test("Codex adapter rejects promptly when app-server exits mid-turn", async () => {
   const adapter = new CodexAdapter({
     executable: process.execPath,

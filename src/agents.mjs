@@ -243,6 +243,16 @@ export class CodexAdapter {
       peer.notify("initialized", {});
       const overrides = request.profile.source === "managed" ? request.profile.overrides : {};
       const threadOverrides = { ...(overrides.thread ?? {}) };
+      if (request.sessionId && request.profile.source === "local") {
+        const { config } = await peer.request("config/read", {
+          includeLayers: false,
+          cwd: request.workspace.path,
+        });
+        // Local profiles follow this host's configuration even when the stored
+        // thread originated on a host with another provider or model.
+        threadOverrides.model = config.model;
+        threadOverrides.modelProvider = config.model_provider;
+      }
       if (request.instructions) {
         threadOverrides.developerInstructions = [
           threadOverrides.developerInstructions,

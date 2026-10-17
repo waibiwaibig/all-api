@@ -7,10 +7,13 @@ lines.on("line", (line) => {
   if (process.argv.includes("--ignore-all")) return;
   if (message.method === "initialize") {
     reply(message.id, { userAgent: "fake-codex" });
+  } else if (message.method === "config/read") {
+    reply(message.id, { config: { model: "deployment-model", model_provider: "deployment-provider" } });
   } else if (message.method === "thread/start") {
     threadParams = message.params;
     reply(message.id, { thread: { id: "codex-thread-1" } });
   } else if (message.method === "thread/resume") {
+    threadParams = message.params;
     reply(message.id, { thread: { id: message.params.threadId } });
   } else if (message.method === "turn/start") {
     reply(message.id, { turn: { id: "turn-1" } });
