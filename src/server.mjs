@@ -12,7 +12,7 @@ import {
   validateConfig,
 } from "./core.mjs";
 
-import { Secretary } from "./secretary.mjs";
+import { AgentService } from "./agent-service.mjs";
 
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -30,11 +30,12 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
   const nativeSessions = new Set();
   const nativeSessionsByKey = new Map();
   const context = { config, registry, responses, files, gate, controllers };
-  const secretary = new Secretary({ config, directory: path.join(dataDirectory, 'secretary'),
+  const agentService = new AgentService({ config, directory: path.join(dataDirectory, 'agent-executions'),
+    origin: () => config.server.publicURL ?? `http://127.0.0.1:${server.address()?.port ?? config.server.port}`,
     prepareRun: (grant, model, workspace, options) => prepareRun(context, grant, model, workspace, options) });
   const server = createServer(async (request, response) => {
     try {
-      await route({ request, response, config, registry, responses, files, gate, controllers, secretary });
+      await route({ request, response, config, registry, responses, files, gate, controllers, agentService });
     } catch (error) {
       if (process.env.ALL_API_DEBUG === "1") console.error(error);
       sendError(response, error, Boolean(request.headers["anthropic-version"]));
@@ -65,7 +66,7 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
     registry,
     responses,
     files,
-    secretary,
+    agentService,
     activity() {
       return { standard: gate.active, native: nativeSessions.size };
     },
@@ -82,7 +83,7 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
       return server.address();
     },
     async close() {
-      secretary.stop();
+      agentService.stop();
       await Promise.allSettled([...nativeSessions].map((close) => close()));
       for (const client of webSockets.clients) client.terminate();
       for (const controller of controllers) controller.abort(new Error("All API is shutting down"));
@@ -90,7 +91,7 @@ export async function createAllApiServer({ config, registry, dataDirectory }) {
       server.close();
       for (const socket of sockets) socket.destroy();
       await registry.close();
-      await Promise.all([responses.close(), files.flush(), secretary.close()]);
+      await Promise.all([responses.close(), files.flush(), agentService.close()]);
     },
   };
 }
@@ -121,12 +122,12 @@ async function route(context) {
     return sendJson(response, 200, await catalog(context, grant));
   }
   if (url.pathname === '/.well-known/agent-card.json' && request.method === 'GET') {
-    context.secretary.authorize(grant);
+    context.agentService.authorize(grant);
     const { AgentCard } = await import('@a2a-js/sdk');
-    return sendJson(response, 200, AgentCard.toJSON(await context.secretary.getAgentCard()));
+    return sendJson(response, 200, AgentCard.toJSON(await context.agentService.getAgentCard(grant)));
   }
   if (url.pathname === '/a2a' && request.method === 'POST') {
-    return sendJson(response, 200, await context.secretary.rpc(await readJson(request), grant, request.headers));
+    return sendJson(response, 200, await context.agentService.rpc(await readJson(request), grant, request.headers));
   }
   requireAccessKey(grant);
   if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
@@ -544,6 +545,7 @@ async function prepareRun(context, grant, modelId, selectedWorkspace, options) {
     workspace: { id: workspace, ...workspaceConfig },
     input,
     instructions: options.instructions,
+    responseSchema: options.responseSchema,
     tools: [],
     sessionId: options.sessionId,
     onSession: options.onSession,

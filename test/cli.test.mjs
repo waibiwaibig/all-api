@@ -77,7 +77,7 @@ test("installed CLI runs through the package-manager symlink", { skip: process.p
     await symlink(cli, entry);
     const { stdout } = await execute(process.execPath, [entry, "help"]);
     assert.match(stdout, /Setup and service:/);
-    assert.match(stdout, /secretary init/);
+    assert.match(stdout, /agent export/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import crypto from "node:crypto";
 import { createConnection, createServer } from "node:net";
 import { chmod, rm } from "node:fs/promises";
@@ -62,23 +61,17 @@ export async function createAdminServer({
       return { agent: params.name, executable: params.path, restartRequired: true };
     }
     if (request.method === "key.list") return publicKeys(config);
-    if (request.method === 'secretary.init') {
-      if (config.secretary) throw new Error('Secretary already configured; preserve its identity and connection file');
+    if (request.method === 'agent.export') {
       requireEntry(config.models, params.model, 'model');
       requireEntry(config.workspaces, params.workspace, 'workspace');
-      const created = await createApiKey({ kind: 'access', name: 'Secretary connection', models: [params.model], workspaces: [params.workspace], defaultWorkspace: params.workspace });
       const next = structuredClone(config);
+      if (params.url) next.server.publicURL = params.url.replace(/\/$/, '');
+      validateConfig(next);
+      const created = await createApiKey({ kind: 'access', name: params.name ?? 'Agent application', models: [params.model], workspaces: [params.workspace], defaultWorkspace: params.workspace });
       next.keys[created.record.id] = created.record;
-      next.secretary = {
-        id: randomUUID(),
-        name: params.name ?? '秘书',
-        model: params.model,
-        workspace: params.workspace,
-        keyId: created.record.id,
-        url: (params.url ?? `http://127.0.0.1:${config.server.port}`).replace(/\/$/, ''),
-      };
       await persist(next);
-      return { version: 1, protocol: 'a2a/1.0', id: next.secretary.id, name: next.secretary.name, agentCardUrl: next.secretary.url + '/.well-known/agent-card.json', token: created.token };
+      const origin = next.server.publicURL ?? `http://127.0.0.1:${config.server.port}`;
+      return { version: 1, protocol: 'a2a/1.0', agent: params.model, agentCardUrl: origin + '/.well-known/agent-card.json', token: created.token };
     }
 
     if (request.method === "key.create") {

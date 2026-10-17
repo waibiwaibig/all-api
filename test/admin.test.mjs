@@ -29,7 +29,7 @@ function config(workspace) {
   };
 }
 
-test("secretary defaults to this deployment's loopback API and scopes its credential", async () => {
+test("agent export defaults to this deployment and scopes each application credential", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "all-api-local-secretary-"));
   let current = config(directory);
   current.server.port = 9189;
@@ -40,15 +40,16 @@ test("secretary defaults to this deployment's loopback API and scopes its creden
     async saveConfig(next) { current = next; },
   });
   try {
-    const connection = await adminRequest(endpoint, "secretary.init", {
+    const connection = await adminRequest(endpoint, "agent.export", {
       model: "codex", workspace: "demo",
     });
     assert.equal(connection.agentCardUrl, "http://127.0.0.1:9189/.well-known/agent-card.json");
-    assert.deepEqual(current.keys[current.secretary.keyId].models, ["codex"]);
-    assert.deepEqual(current.keys[current.secretary.keyId].workspaces, ["demo"]);
-    await assert.rejects(() => adminRequest(endpoint, "secretary.init", {
-      model: "codex", workspace: "demo",
-    }), /already configured/i);
+    assert.deepEqual(Object.values(current.keys).at(-1).models, ["codex"]);
+    assert.deepEqual(Object.values(current.keys).at(-1).workspaces, ["demo"]);
+    const second = await adminRequest(endpoint, "agent.export", { model: "codex", workspace: "demo" });
+    assert.notEqual(second.token, connection.token);
+    assert.equal(current.secretary, undefined);
+    assert.equal(connection.agent, "codex");
   } finally {
     await server.close();
     await rm(directory, { recursive: true, force: true });

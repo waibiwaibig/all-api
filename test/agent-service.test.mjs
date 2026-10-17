@@ -15,10 +15,10 @@ import {
 import { createApiKey } from "../src/core.mjs";
 import { AgentRegistry } from "../src/agents.mjs";
 import { createAllApiServer } from "../src/server.mjs";
-import { DELIVERY_EXTENSION } from "../src/secretary.mjs";
+import { EXECUTION_EXTENSION } from "../src/agent-service.mjs";
 
 async function fixture(t) {
-  const directory = await mkdtemp(path.join(tmpdir(), "secretary-test-"));
+  const directory = await mkdtemp(path.join(tmpdir(), "execution-test-"));
   const key = await createApiKey({
     kind: "access",
     name: "secretary",
@@ -38,6 +38,7 @@ async function fixture(t) {
       runs.push(r);
       r.onSession?.("engine-thread");
       if (wait) await wait;
+      if (r.responseSchema) yield { type: "structured", data: { reply: "structured result" } };
       yield { type: "text.delta", delta: "reply:" + r.input[0].text };
       yield { type: "completed", sessionId: "engine-thread" };
     },
@@ -57,14 +58,6 @@ async function fixture(t) {
     workspaces: { work: { path: directory } },
     keys: { [key.record.id]: key.record },
     connectors: {},
-    secretary: {
-      id: randomUUID(),
-      name: "Secretary",
-      model: "fixture",
-      workspace: "work",
-      keyId: key.record.id,
-      url: "http://127.0.0.1",
-    },
   };
   let app, base;
   const start = async () => {
@@ -76,7 +69,6 @@ async function fixture(t) {
     });
     const address = await app.listen();
     base = `http://127.0.0.1:${address.port}`;
-    config.secretary.url = base;
   };
   await start();
   t.after(async () => {
@@ -90,7 +82,7 @@ async function fixture(t) {
         ...Object.fromEntries(new Headers(init?.headers)),
         authorization: `Bearer ${key.token}`,
         "a2a-version": "1.0",
-        "a2a-extensions": DELIVERY_EXTENSION,
+        "a2a-extensions": EXECUTION_EXTENSION,
       },
     });
   const client = async () => {
@@ -137,13 +129,13 @@ async function fixture(t) {
     },
   };
 }
-const message = (id, text, contextId) =>
+const message = (id, text, contextId = "application-context") =>
   SendMessageRequest.fromJSON({
-    message: { messageId: id, role: "ROLE_USER", contextId, parts: [{ text }] },
+    message: { messageId: id, role: "ROLE_USER", contextId, parts: [{ text }], metadata: { execution: { agent: "fixture" } } },
     configuration: { returnImmediately: true },
   });
 async function final(client, id) {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 400; i++) {
     const task = await client.getTask(GetTaskRequest.fromJSON({ id }));
     if (![1, 2].includes(task.status.state)) return task;
     await delay(10);
@@ -175,9 +167,9 @@ test("official A2A client: durable duplicate, conflict, restart and one continue
   assert.equal(second.contextId, first.contextId);
   assert.equal(f.runs[1].sessionId, "engine-thread");
   assert.equal(f.runs.length, 2);
-  await assert.rejects(() =>
-    client.sendMessage(message(randomUUID(), "bad", "other-context")),
-  );
+  const independent = await final(client, (await client.sendMessage(message(randomUUID(), "separate", "other-context"))).id);
+  assert.equal(independent.contextId, "other-context");
+  assert.equal(f.runs[2].sessionId, undefined);
 });
 
 test("queued tasks serialize; cancel never claims running effects were undone; auth is isolated", async (t) => {
@@ -212,8 +204,10 @@ test("queued tasks serialize; cancel never claims running effects were undone; a
         headers: { authorization: `Bearer ${other.token}` },
       })
     ).status,
-    403,
+    200,
   );
+  const denied = await fetch(`${f.base}/a2a`, { method: "POST", headers: { authorization: `Bearer ${other.token}`, "content-type": "application/json", "a2a-version": "1.0", "a2a-extensions": EXECUTION_EXTENSION }, body: JSON.stringify({ jsonrpc: "2.0", id: "other", method: "GetTask", params: { id: one.id } }) });
+  assert.ok((await denied.json()).error);
 });
 
 test("unfinished persisted execution becomes unconfirmed and is not replayed", async (t) => {
@@ -222,7 +216,7 @@ test("unfinished persisted execution becomes unconfirmed and is not replayed", a
   const input = message(randomUUID(), "operation");
   const task = await final(client, (await client.sendMessage(input)).id);
   task.status.state = S.TASK_STATE_WORKING;
-  f.app.secretary.save(task);
+  f.app.agentService.save(task);
   await f.restart();
   const restored = await final(await f.client(), task.id);
   assert.equal(restored.status.state, S.TASK_STATE_FAILED);
@@ -243,4 +237,32 @@ test("cancel during preflight never starts the engine and releases capacity", as
   await delay(30);
   assert.equal(f.runs.length, 0);
   assert.equal(f.app.activity().standard, 0);
+});
+
+test("generic instructions and JSON schema belong to the caller and are part of durable message identity", async (t) => {
+  const f = await fixture(t), client = await f.client();
+  const input = message(randomUUID(), "Classify this document", "document-application");
+  input.message.metadata.execution.instructions = "You are a document classifier.";
+  input.message.metadata.execution.responseSchema = {type:"object",properties:{reply:{type:"string"}},required:["reply"],additionalProperties:false};
+  const task = await final(client, (await client.sendMessage(input)).id);
+  assert.equal(task.status.state, S.TASK_STATE_COMPLETED);
+  assert.deepEqual(task.artifacts[0].parts[0].content, {$case:"data",value:{reply:"structured result"}});
+  assert.equal(f.runs[0].instructions, "You are a document classifier.");
+  assert.ok(!JSON.stringify(task).includes("engine-thread"));
+  input.message.metadata.execution.instructions = "Changed purpose";
+  await assert.rejects(() => client.sendMessage(input));
+  assert.equal(f.runs.length, 1);
+});
+
+test("different applications can reuse message and context identifiers without sharing sessions or tasks", async (t) => {
+  const f = await fixture(t), client = await f.client();
+  const id = randomUUID();
+  const first = await final(client, (await client.sendMessage(message(id, "first tenant"))).id);
+  const other = await createApiKey({kind:"access",name:"another application",models:["fixture"],workspaces:["work"],defaultWorkspace:"work"});
+  f.config.keys[other.record.id] = other.record;
+  const secondClient = await new ClientFactory({transports:[new JsonRpcTransportFactory({fetchImpl:(url, init) => fetch(url, {...init,headers:{...Object.fromEntries(new Headers(init?.headers)), authorization:`Bearer ${other.token}`,"a2a-version":"1.0","a2a-extensions":EXECUTION_EXTENSION}})})]}).createFromAgentCard(AgentCard.fromJSON(await (await f.authFetch(`${f.base}/.well-known/agent-card.json`)).json()));
+  const second = await final(secondClient, (await secondClient.sendMessage(message(id, "second tenant"))).id);
+  assert.notEqual(first.id, second.id);
+  assert.equal(f.runs[1].sessionId, undefined);
+  await assert.rejects(() => secondClient.getTask(GetTaskRequest.fromJSON({id:first.id})));
 });

@@ -1,8 +1,8 @@
 # All API
 
-All API 是运行在 Agent 同一台机器上的桥接器。它把本机 Codex、Claude
-以及外部连接器暴露成 OpenAI、Anthropic 和原生协议，同时让配置、权限、
-工具执行与会话继续由 Agent 自己负责。
+All API 提供统一的 Agent 执行接口，内部适配 Codex、Claude 及外部连接器。应用通过网络调用它，Agent 在服务端执行并使用已配置的大模型 API。应用与 All API 可以部署在不同机器。
+
+它提供持久 A2A 执行、OpenAI／Anthropic 标准协议和原生协议；后端差异由 All API 处理，应用保有自身身份、记忆和业务逻辑。
 
 ```mermaid
 flowchart LR
@@ -17,7 +17,7 @@ flowchart LR
     R --> P["外部 Agent 连接器"]
 ```
 
-可选的[持久秘书服务](docs/secretary.md)提供一个长期入口，通过 A2A 1.0 对接 Knock 等客户端；模型和底层会话留在主机管理。
+[统一 Agent API](docs/agent-api.md)通过 A2A 1.0 提供按调用方隔离的上下文、持久任务和结构化结果。Knock 等应用自行管理秘书角色与记忆，All API 不包含秘书业务。
 
 完整产品决策和更多架构图见 [DECISION_MAP.md](./DECISION_MAP.md)。
 

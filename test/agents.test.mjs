@@ -12,6 +12,31 @@ const fakeCodex = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta
 const profile = { agent: "fixture", source: "local" };
 const workspace = { id: "demo", path: process.cwd() };
 
+test("both engines expose the same structured result event and native session continuation", async () => {
+  const responseSchema = { type: "object", properties: { reply: { type: "string" } }, required: ["reply"], additionalProperties: false };
+  let claudeOptions;
+  const adapters = [
+    new CodexAdapter({ executable: process.execPath, appServerArgs: [fakeCodex] }),
+    new ClaudeAdapter({ query: ({ options }) => {
+      claudeOptions = options;
+      return (async function* () {
+        yield { type: "assistant", session_id: "existing-session", message: { content: [{type:"text",text:"intermediate prose"}] } };
+        yield { type: "result", subtype: "success", session_id: "existing-session", structured_output: {reply:"structured claude"} };
+      })();
+    } }),
+  ];
+  for (const adapter of adapters) {
+    const events = [];
+    for await (const event of adapter.run({ model: "fixture", profile, workspace, sessionId: "existing-session", responseSchema,
+      input: [{type:"text",text:"return a reply"}], tools: [], signal: new AbortController().signal })) events.push(event);
+    assert.equal(events.find(e => e.type === "structured").data.reply.startsWith("structured"), true);
+    assert.equal(events.at(-1).type, "completed");
+    assert.equal(events.at(-1).sessionId, "existing-session");
+  }
+  assert.deepEqual(claudeOptions.outputFormat, {type:"json_schema",schema:responseSchema});
+  assert.equal(claudeOptions.resume, "existing-session");
+});
+
 test("JSON-RPC requests time out when an Agent stays silent", async () => {
   const peer = new JsonLinePeer(process.execPath, [fakeCodex, "--ignore-all"], {
     rpcTimeoutMs: 25,

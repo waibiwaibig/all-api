@@ -60,6 +60,10 @@ lines.on("line", (line) => {
       itemId: "item-1",
       delta: "codex",
     });
+    emit("item/completed", {
+      threadId: message.params.threadId, turnId: "turn-1",
+      item: { type: "agentMessage", id: "item-1", text: message.params.outputSchema ? JSON.stringify({ reply: "structured codex" }) : "official codex" },
+    });
     emit("thread/tokenUsage/updated", {
       threadId: message.params.threadId,
       turnId: "turn-1",

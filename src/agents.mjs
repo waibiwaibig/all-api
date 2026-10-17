@@ -235,9 +235,10 @@ export class CodexAdapter {
     let threadId;
     let turnId;
     let usage;
+    let finalText;
     try {
       await peer.request("initialize", {
-        clientInfo: { name: "all-api", title: "All API", version: "0.5.1" },
+        clientInfo: { name: "all-api", title: "All API", version: "0.6.0" },
         capabilities: { experimentalApi: true },
       });
       peer.notify("initialized", {});
@@ -275,6 +276,7 @@ export class CodexAdapter {
         threadId,
         input: toCodexInput(request.input),
         ...(overrides.turn ?? {}),
+        ...(request.responseSchema && { outputSchema: request.responseSchema }),
       });
       turnId = turn.turn.id;
       request.signal?.addEventListener("abort", () => {
@@ -284,6 +286,8 @@ export class CodexAdapter {
       for await (const message of queue) {
         if (message.method === "item/agentMessage/delta") {
           yield { type: "text.delta", delta: message.params.delta };
+        } else if (message.method === "item/completed" && message.params.item?.type === "agentMessage") {
+          finalText = message.params.item.text;
         } else if (message.method === "thread/tokenUsage/updated"
           && message.params.turnId === turnId) {
           usage = codexUsage(message.params.tokenUsage.last);
@@ -293,6 +297,10 @@ export class CodexAdapter {
           return;
         } else if (message.method === "turn/completed" && message.params.turn.id === turnId) {
           if (message.params.turn.status === "completed") {
+            if (request.responseSchema) {
+              if (typeof finalText !== "string") throw new Error("Codex did not return a completed structured message");
+              yield { type: "structured", data: JSON.parse(finalText) };
+            }
             yield { type: "completed", sessionId: threadId, ...(usage && { usage }) };
             return;
           }
@@ -378,6 +386,7 @@ export class ClaudeAdapter {
         ...(request.sessionId ? { resume: request.sessionId } : {}),
         ...claudeOptions,
         ...(systemPrompt && { systemPrompt }),
+        ...(request.responseSchema && { outputFormat: { type: "json_schema", schema: request.responseSchema } }),
         abortController: abortControllerFrom(request.signal),
         canUseTool: async (toolName, input, details) => {
           const { signal, ...metadata } = details;
@@ -428,6 +437,10 @@ export class ClaudeAdapter {
           );
           error.code = message.subtype;
           throw error;
+        }
+        if (request.responseSchema) {
+          if (message.structured_output === undefined) throw new Error("Claude did not return structured output");
+          yield { type: "structured", data: message.structured_output };
         }
         yield {
           type: "completed",
