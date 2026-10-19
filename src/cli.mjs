@@ -49,6 +49,9 @@ export async function main(argv) {
       await file.writeFile(JSON.stringify(connection, null, 2) + '\n');
       await file.sync();
       return output({ configured: true, connectionFile: filename });
+    } catch (error) {
+      await rm(filename, { force: true });
+      throw error;
     } finally { await file.close(); }
   }
   if (command === "serve") return serve();
@@ -348,40 +351,10 @@ async function managementCall(method, params, options) {
   try {
     return await adminRequest(endpoint, method, params, options);
   } catch (error) {
-    if (!["ENOENT", "ECONNREFUSED", "EPIPE"].includes(error.code)) throw error;
-  }
-  let config = await store.load();
-  const actions = {
-    "agent.detect": () => detectAgents(),
-    "agent.install": ({ name }) => installAgent(name),
-    "agent.update": ({ name }) => updateAgent(name),
-    "autostart.set": ({ enabled, wslProxyPort }) => setAutostart({
-      enabled: Boolean(enabled), dataDirectory, cliPath, wslProxyPort,
-    }),
-    "exposure.cloudflare.configure": (value, current) => configureCloudflare({
-      dataDirectory,
-      name: value.name,
-      hostname: value.hostname,
-      localPort: current.server.port,
-    }),
-    "exposure.start": (value, current) => startExposure(value.provider, {
-      ...value, dataDirectory, localPort: current.server.port,
-    }),
-    "exposure.stop": (value) => stopExposure(value.provider, { ...value, dataDirectory }),
-  };
-  const local = await createAdminServer({
-    endpoint,
-    getConfig: () => config,
-    async saveConfig(next) {
-      await store.save(next);
-      config = next;
-    },
-    actions,
-  });
-  try {
-    return await adminRequest(endpoint, method, params, options);
-  } finally {
-    await local.close();
+    if (["ENOENT", "ECONNREFUSED", "EPIPE"].includes(error.code)) {
+      throw new Error("All API management is unavailable; start it with all-api up and wait until ready", { cause: error });
+    }
+    throw error;
   }
 }
 

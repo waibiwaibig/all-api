@@ -238,7 +238,7 @@ export class CodexAdapter {
     let finalText;
     try {
       await peer.request("initialize", {
-        clientInfo: { name: "all-api", title: "All API", version: "0.6.0" },
+        clientInfo: { name: "all-api", title: "All API", version: "0.6.1" },
         capabilities: { experimentalApi: true },
       });
       peer.notify("initialized", {});

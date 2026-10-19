@@ -25,9 +25,19 @@ test("CLI initializes, starts, reports health, and stops through local managemen
     assert.equal(saved.version, 4);
     assert.equal(saved.keys[Object.keys(saved.keys)[0]].defaultWorkspace, "default");
 
+    const connectionFile = path.join(directory, 'agent.json');
+    await assert.rejects(run(['agent', 'export', '--model', 'codex', '--workspace', 'default', '--output', connectionFile], env), /management is unavailable/);
+    assert.equal(await readFile(path.join(directory, 'config.json'), 'utf8'), configText);
+    await assert.rejects(readFile(connectionFile), { code: 'ENOENT' });
+
     const started = await run(["up"], env);
     pid = started.pid;
     assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).status, "ok");
+
+    await run(['agent', 'export', '--model', 'codex', '--workspace', 'default', '--output', connectionFile], env);
+    const connection = JSON.parse(await readFile(connectionFile, 'utf8'));
+    const card = await fetch(connection.agentCardUrl, { headers: { authorization: `Bearer ${connection.token}` } });
+    assert.equal(card.status, 200, 'exported credential must work without restarting the service');
 
     const status = await run(["status"], env);
     assert.equal(status.server.running, true);

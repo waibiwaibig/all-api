@@ -5,6 +5,7 @@ All API 运行通用 Agent，应用拥有业务身份、角色、长期记忆和
 ## 连接与部署
 
 ```sh
+all-api up
 all-api agent export --model codex --workspace default --output /private/agent-api.json
 ```
 
@@ -42,3 +43,5 @@ SQLite WAL 保存上下文、任务和去重记录，独占状态锁阻止多个
 - `test/agents.test.mjs`：两个后端归一为相同结构化事件及续接语义；模拟测试与真实 Agent 验收分别报告。
 
 依据：[Codex App Server](https://developers.openai.com/codex/app-server) 的 Start a turn 部分定义 `outputSchema` 的逐轮作用域及 `turn/completed`；[Claude Agent SDK structured outputs](https://platform.claude.com/docs/en/agent-sdk/structured-outputs) 的 Define your schema 部分定义 `outputFormat` 和 `structured_output`。本实现使用这些原生机制并进行统一结果校验。
+
+管理命令仅连接已经运行的服务。服务尚未就绪时明确报错，不创建临时管理进程或另行写入配置，避免启动过程读取旧凭证。
